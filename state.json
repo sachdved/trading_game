@@ -1,0 +1,1 @@
+{"game": {"phase": "lobby", "round": 0, "settings": {"roles": "assigned", "dealPool": "hs", "quoteSeconds": 90, "marketSeconds": 120}, "players": {}, "joinOrder": [], "publicCards": [], "quotes": {}, "lastQuotes": null, "book": {"bids": [], "asks": []}, "trades": [], "log": [], "deadline": null, "settlement": null}, "tokens": {}, "hostKey": "7706ec59"}
