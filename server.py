@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
-"""The exchange server for the Glosten-Milgrom classroom trading game.
+"""The multi-room exchange server for the Glosten-Milgrom trading game.
+
+Anyone who opens the landing page can create a *room* (an independent game
+with its own 5-letter code and host key) — like a party-game lobby. Rooms
+live in memory, snapshot to STATE_DIR/<CODE>.json, and expire when idle.
 
 Python 3.9+ standard library only — run with:  python3 server.py
-Options via env: PORT (default 3000, 0 = random), HOST_KEY, JOIN_URL, STATE_FILE.
-Flags: --fresh  (ignore any saved game snapshot and start clean)
+Options via env:
+  PORT (default 3000, 0 = random)     JOIN_URL   (public base URL for links)
+  STATE_DIR (default ./state)         TRUST_PROXY=1 (honor X-Forwarded-For)
+  MAX_ROOMS / MAX_CLIENTS / MAX_CLIENTS_PER_ROOM
+  RATE_CREATES_PER_MIN / RATE_JOINS_PER_MIN
+  ROOM_TTL_MINUTES / SETTLED_TTL_MINUTES
+Flags: --fresh  (discard all saved room snapshots and start clean)
 
 Views served:
-  /            player view (join from phones)
-  /board       projector view (public info only)
-  /host?key=K  host control panel (key printed below at startup)
+  /                     landing page (create a room / join by code)
+  /r/CODE               player view (join from phones)
+  /r/CODE/board         projector view (public info only)
+  /r/CODE/host?key=K    host control panel (key issued at room creation)
+  /healthz              room/client counts for monitoring
 """
 
 import json
 import os
 import queue
 import random
+import re
 import secrets
 import signal
 import socket
@@ -22,148 +34,322 @@ import sys
 import threading
 import time
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import engine as E
 
-VERSION = '1.0.0'
+VERSION = '2.0.0'
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PUBLIC_DIR = os.path.join(BASE_DIR, 'public')
-STATE_FILE = os.environ.get('STATE_FILE', os.path.join(BASE_DIR, 'state.json'))
+STATE_DIR = os.environ.get('STATE_DIR', os.path.join(BASE_DIR, 'state'))
 FRESH = '--fresh' in sys.argv
+
+
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, ''))
+    except ValueError:
+        return default
+
+
+MAX_ROOMS = _env_int('MAX_ROOMS', 40)
+MAX_CLIENTS = _env_int('MAX_CLIENTS', 400)              # SSE streams, all rooms
+MAX_CLIENTS_PER_ROOM = _env_int('MAX_CLIENTS_PER_ROOM', 120)
+ROOM_TTL_MS = _env_int('ROOM_TTL_MINUTES', 120) * 60_000
+SETTLED_TTL_MS = _env_int('SETTLED_TTL_MINUTES', 30) * 60_000
+REAP_EVERY_S = 60
+RATE_LIMITS = {                                          # per client IP
+    'create': (_env_int('RATE_CREATES_PER_MIN', 5), 60),
+    'join': (_env_int('RATE_JOINS_PER_MIN', 30), 60),
+}
+TRUST_PROXY = os.environ.get('TRUST_PROXY', '') not in ('', '0', 'false')
 
 LOCK = threading.RLock()
 RNG = random.Random()
-GAME = E.create_game()
-TOKENS = {}          # token -> pid
-HOST_KEY = os.environ.get('HOST_KEY') or secrets.token_hex(4)
-CLIENTS = set()      # live SSE connections
-RECENT_REQ = {}      # pid -> OrderedDict(reqId -> cached market-order response)
-JOIN_URL = None      # filled in once we know the port
-TIMER = None
-SAVE_TIMER = None
+ROOMS = {}           # code -> Room
+BUCKETS = {}         # (kind, ip) -> deque of request timestamps
+BASE_URL = None      # public base URL, filled in once we know the port
+STARTED = time.time()
+
+CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ'   # no I/L/O — phone-typeable
+CODE_LEN = 5
+ROOM_PATH_RE = re.compile(rf'^/r/([A-Za-z]{{{CODE_LEN}}})(/.*)?$')
 
 
 def now_ms():
     return int(time.time() * 1000)
 
 
+# ---------------------------------------------------------------- rooms
+
+class Client:
+    __slots__ = ('q', 'kind', 'pid', 'token')
+
+    def __init__(self, kind, pid=None, token=None):
+        self.q = queue.Queue(maxsize=100)
+        self.kind = kind
+        self.pid = pid
+        self.token = token
+
+
+class Room:
+    """One independent game: state, sessions, live streams, timers."""
+
+    def __init__(self, code, host_key=None):
+        self.code = code
+        self.game = E.create_game()
+        self.tokens = {}          # token -> pid
+        self.clients = set()      # live SSE connections
+        self.recent_req = {}      # pid -> OrderedDict(reqId -> cached response)
+        self.host_key = host_key or secrets.token_hex(8)
+        self.timer = None         # phase-deadline timer
+        self.save_timer = None    # debounced snapshot timer
+        self.created = now_ms()
+        self.last_active = now_ms()
+
+    def alive(self):
+        return ROOMS.get(self.code) is self
+
+    def join_url(self):
+        return f'{BASE_URL}/r/{self.code}' if BASE_URL else None
+
+    def host_url(self):
+        return f'{BASE_URL}/r/{self.code}/host?key={self.host_key}' if BASE_URL else None
+
+    def connections(self):
+        counts = {}
+        for c in self.clients:
+            if c.kind == 'player' and c.pid:
+                counts[c.pid] = counts.get(c.pid, 0) + 1
+        return counts
+
+
+def new_code():
+    while True:
+        code = ''.join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN))
+        if code not in ROOMS:
+            return code
+
+
+def create_room():
+    """Caller must hold LOCK."""
+    if len(ROOMS) >= MAX_ROOMS:
+        raise E.GameError('The server is at its room limit right now — try again later.',
+                          code='busy')
+    room = Room(new_code())
+    ROOMS[room.code] = room
+    E.note(room.game, f'Room {room.code} created', now_ms())
+    persist_soon(room)
+    return room
+
+
+def total_clients():
+    return sum(len(r.clients) for r in ROOMS.values())
+
+
+def room_ttl_ms(room):
+    g = room.game
+    done = g['phase'] == 'settled' or (g['phase'] == 'lobby' and not E.active_players(g))
+    return SETTLED_TTL_MS if done else ROOM_TTL_MS
+
+
+def reap_rooms(now):
+    """Delete rooms nobody is connected to that have been idle past their TTL."""
+    removed = []
+    with LOCK:
+        for room in list(ROOMS.values()):
+            if room.clients:
+                continue
+            if now - room.last_active <= room_ttl_ms(room):
+                continue
+            if room.timer:
+                room.timer.cancel()
+            if room.save_timer:
+                room.save_timer.cancel()
+            del ROOMS[room.code]
+            delete_room_file(room.code)
+            removed.append(room.code)
+        # tidy stale rate-limit buckets while we are here
+        cutoff = time.time() - 300
+        for key in [k for k, d in BUCKETS.items() if not d or d[-1] < cutoff]:
+            del BUCKETS[key]
+    for code in removed:
+        print(f'[gm] room {code} expired and was removed', flush=True)
+    return removed
+
+
+def reaper_loop():
+    while True:
+        time.sleep(REAP_EVERY_S)
+        try:
+            reap_rooms(now_ms())
+        except Exception as e:   # never let the reaper thread die
+            print(f'[gm] reaper error: {e!r}', flush=True)
+
+
+# ---------------------------------------------------------------- rate limiting
+
+def allow(ip, kind):
+    limit, per = RATE_LIMITS[kind]
+    if limit <= 0:
+        return True
+    # Loopback is exempt: it is either the operator's own browser or a tunnel
+    # (cloudflared/ngrok) funneling a whole classroom through one local peer —
+    # rate-limiting that shared address would lock out legitimate players.
+    # (Behind a real reverse proxy, set TRUST_PROXY=1 so per-client IPs apply.)
+    if ip in ('127.0.0.1', '::1', '::ffff:127.0.0.1'):
+        return True
+    with LOCK:
+        d = BUCKETS.setdefault((kind, ip), deque())
+        cutoff = time.time() - per
+        while d and d[0] < cutoff:
+            d.popleft()
+        if len(d) >= limit:
+            return False
+        d.append(time.time())
+        return True
+
+
 # ---------------------------------------------------------------- persistence
 
-def load_snapshot():
-    global GAME, TOKENS, HOST_KEY
-    if FRESH or not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, encoding='utf-8') as f:
-            snap = json.load(f)
-        if snap.get('game', {}).get('phase'):
-            GAME = snap['game']
-            TOKENS = snap.get('tokens', {})
-            HOST_KEY = os.environ.get('HOST_KEY') or snap.get('hostKey') or HOST_KEY
-            print(f"[gm] resumed saved game (phase {GAME['phase']}, round {GAME['round']}) "
-                  f"from {STATE_FILE} — run with --fresh to discard", flush=True)
-    except (OSError, ValueError) as e:
-        print(f'[gm] could not load {STATE_FILE}: {e}', flush=True)
+def room_file(code):
+    return os.path.join(STATE_DIR, code + '.json')
 
 
-def save_now():
+def save_room(room):
     try:
-        tmp = STATE_FILE + '.tmp'
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = room_file(room.code) + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump({'game': GAME, 'tokens': TOKENS, 'hostKey': HOST_KEY}, f)
-        os.replace(tmp, STATE_FILE)
+            json.dump({'code': room.code, 'game': room.game, 'tokens': room.tokens,
+                       'hostKey': room.host_key, 'created': room.created,
+                       'lastActive': room.last_active}, f)
+        os.replace(tmp, room_file(room.code))
     except OSError as e:
-        print(f'[gm] failed to save state: {e}', flush=True)
+        print(f'[gm] failed to save room {room.code}: {e}', flush=True)
 
 
-def persist_soon():
-    global SAVE_TIMER
-    if SAVE_TIMER:
-        SAVE_TIMER.cancel()
+def delete_room_file(code):
+    try:
+        os.remove(room_file(code))
+    except OSError:
+        pass
+
+
+def persist_soon(room):
+    if room.save_timer:
+        room.save_timer.cancel()
 
     def run():
         with LOCK:
-            save_now()
-    SAVE_TIMER = threading.Timer(0.25, run)
-    SAVE_TIMER.daemon = True
-    SAVE_TIMER.start()
+            if room.alive():
+                save_room(room)
+    room.save_timer = threading.Timer(0.25, run)
+    room.save_timer.daemon = True
+    room.save_timer.start()
+
+
+def load_rooms():
+    """Restore saved rooms at boot (or wipe them with --fresh)."""
+    try:
+        files = [f for f in os.listdir(STATE_DIR) if f.endswith('.json')]
+    except OSError:
+        return
+    now = now_ms()
+    for fname in files:
+        path = os.path.join(STATE_DIR, fname)
+        if FRESH:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        try:
+            with open(path, encoding='utf-8') as f:
+                snap = json.load(f)
+            code = str(snap.get('code') or '').upper()
+            if (not re.fullmatch(f'[A-Z]{{{CODE_LEN}}}', code)
+                    or code != os.path.splitext(fname)[0].upper()
+                    or not snap.get('game', {}).get('phase')):
+                continue
+            room = Room(code, host_key=snap.get('hostKey'))
+            room.game = snap['game']
+            room.tokens = snap.get('tokens', {})
+            room.created = snap.get('created', now)
+            room.last_active = snap.get('lastActive', now)
+            if now - room.last_active > room_ttl_ms(room):
+                os.remove(path)          # expired while the server was down
+                continue
+            ROOMS[code] = room
+        except (OSError, ValueError) as e:
+            print(f'[gm] could not load {path}: {e}', flush=True)
+    if ROOMS and not FRESH:
+        print(f"[gm] resumed {len(ROOMS)} saved room(s): {', '.join(sorted(ROOMS))} "
+              f'— run with --fresh to discard', flush=True)
 
 
 # ---------------------------------------------------------------- live updates
 
-class Client:
-    __slots__ = ('q', 'kind', 'pid')
-
-    def __init__(self, kind, pid=None):
-        self.q = queue.Queue(maxsize=100)
-        self.kind = kind
-        self.pid = pid
-
-
-def connections():
-    counts = {}
-    for c in CLIENTS:
-        if c.kind == 'player' and c.pid:
-            counts[c.pid] = counts.get(c.pid, 0) + 1
-    return counts
-
-
-def broadcast():
-    """Push a per-audience view of the current state to every open stream."""
-    extras = {'now': now_ms(), 'joinUrl': JOIN_URL, 'connections': connections(),
-              'hostUrl': f'{JOIN_URL}/host?key={HOST_KEY}' if JOIN_URL else None}
-    for c in list(CLIENTS):
-        payload = json.dumps(E.view_for(GAME, c.kind, c.pid, extras))
+def broadcast(room):
+    """Push a per-audience view of the room's state to every open stream."""
+    extras = {'now': now_ms(), 'joinUrl': room.join_url(), 'hostUrl': room.host_url(),
+              'roomCode': room.code, 'connections': room.connections()}
+    for c in list(room.clients):
+        payload = json.dumps(E.view_for(room.game, c.kind, c.pid, extras))
         try:
             c.q.put_nowait(payload)
         except queue.Full:
             pass  # hopelessly slow client; it will resync on its next message
 
 
-def touched():
-    """Call under LOCK after any successful mutation."""
-    persist_soon()
-    rearm()
-    broadcast()
+def touched(room):
+    """Call under LOCK after any successful mutation of the room."""
+    room.last_active = now_ms()
+    persist_soon(room)
+    rearm(room)
+    broadcast(room)
 
 
-# ---------------------------------------------------------------- phase timer
+# ---------------------------------------------------------------- phase timers
 
-def rearm():
-    global TIMER
-    if TIMER:
-        TIMER.cancel()
-        TIMER = None
-    deadline = GAME.get('deadline')
+def rearm(room):
+    if room.timer:
+        room.timer.cancel()
+        room.timer = None
+    deadline = room.game.get('deadline')
     if deadline is not None:
         delay = max(0.0, (deadline - now_ms()) / 1000) + 0.03
-        TIMER = threading.Timer(delay, fire)
-        TIMER.daemon = True
-        TIMER.start()
+        room.timer = threading.Timer(delay, fire, args=(room,))
+        room.timer.daemon = True
+        room.timer.start()
 
 
-def fire():
+def fire(room):
     with LOCK:
+        if not room.alive():
+            return
         try:
-            did = E.on_deadline(GAME, now_ms(), RNG)
-        except Exception as e:  # never let the timer thread die silently
-            print(f'[gm] timer error: {e}', flush=True)
+            did = E.on_deadline(room.game, now_ms(), RNG)
+        except Exception as e:  # never let a timer thread die silently
+            print(f'[gm] timer error in room {room.code}: {e}', flush=True)
             did = None
         if did:
-            touched()
+            touched(room)
         else:
-            rearm()
+            rearm(room)
 
 
 # ---------------------------------------------------------------- http plumbing
 
 MIME = {'.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
         '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml'}
-STATIC = {'/': 'index.html', '/host': 'index.html', '/board': 'index.html',
-          '/app.js': 'app.js', '/style.css': 'style.css'}
+ERROR_CODES = {'taken': 409, 'badkey': 403, 'rate': 429, 'no-room': 404, 'busy': 503}
+
+
+def no_room_error():
+    return E.GameError("That room doesn't exist — it may have expired.", code='no-room')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -177,20 +363,17 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-    def log_message(self, *args):  # keep the console clean for the host
+    def log_message(self, *args):  # keep the console clean
         pass
 
-    def local_admin(self):
-        """True when the request comes from a browser on the server machine itself.
-
-        Loopback peer alone is not enough: tunnels (cloudflared/ngrok) also connect
-        from loopback, so we additionally require a localhost Host header, which
-        tunnels do not send. Lets the person who started the server open /host
-        without copying the key from the terminal."""
-        if self.client_address[0] not in ('127.0.0.1', '::1', '::ffff:127.0.0.1'):
-            return False
-        host = (self.headers.get('Host') or '').split(':')[0].strip().lower()
-        return host in ('localhost', '127.0.0.1')
+    def client_ip(self):
+        if TRUST_PROXY:
+            xff = self.headers.get('X-Forwarded-For')
+            if xff:
+                # The RIGHTMOST entry is the one our own trusted proxy appended;
+                # everything left of it is client-supplied and spoofable.
+                return xff.split(',')[-1].strip()
+        return self.client_address[0]
 
     # ---- helpers
 
@@ -206,12 +389,20 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
+    def redirect(self, where):
+        self.send_response(302)
+        self.send_header('Location', where)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def read_json(self):
         try:
             n = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             n = 0
-        if n > 16384:
+        if n > 16384 or n < 0:
+            # the unread body would desync this keep-alive connection — drop it
+            self.close_connection = True
             raise E.GameError('Request too large.')
         raw = self.rfile.read(n) if n else b''
         try:
@@ -219,8 +410,16 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise E.GameError('Malformed request.')
 
-    def require_host(self, params):
-        if params.get('key') != HOST_KEY and not self.local_admin():
+    def get_room(self, code):
+        """Look up a live room or raise. Caller should hold LOCK for mutations."""
+        room = ROOMS.get(code)
+        if room is None:
+            raise no_room_error()
+        return room
+
+    @staticmethod
+    def require_host(room, params):
+        if params.get('key') != room.host_key:
             raise E.GameError('Bad host key.', code='badkey')
 
     # ---- GET
@@ -228,27 +427,57 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         path = url.path.rstrip('/') or '/'
-        if path in STATIC:
-            return self.serve_static(STATIC[path])
-        if path == '/events':
-            return self.serve_events(urllib.parse.parse_qs(url.query))
-        if path == '/api/state':
-            q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
-            try:
-                self.require_host(q)
-            except E.GameError as e:
-                return self.reply(403, {'error': str(e)})
+        if path == '/':
+            return self.serve_static('index.html')
+        if path in ('/app.js', '/style.css'):
+            return self.serve_static(path.lstrip('/'))
+        if path == '/healthz':
             with LOCK:
-                view = E.view_for(GAME, 'host', None,
-                                  {'now': now_ms(), 'joinUrl': JOIN_URL,
-                                   'hostUrl': f'{JOIN_URL}/host?key={HOST_KEY}' if JOIN_URL else None,
-                                   'connections': connections()})
-            return self.reply(200, view)
+                return self.reply(200, {'ok': True, 'version': VERSION,
+                                        'rooms': len(ROOMS), 'clients': total_clients(),
+                                        'uptimeSeconds': int(time.time() - STARTED)})
         if path == '/favicon.ico':
             self.send_response(204)
             self.send_header('Content-Length', '0')
             self.end_headers()
             return
+        if path in ('/host', '/board'):   # pre-multiroom bookmarks
+            return self.redirect('/')
+
+        m = re.match(rf'^/api/rooms/([A-Za-z]{{{CODE_LEN}}})$', path)
+        if m:
+            with LOCK:
+                room = ROOMS.get(m.group(1).upper())
+                if room is None:
+                    return self.reply(404, {'error': 'No room with that code.',
+                                            'code': 'no-room'})
+                return self.reply(200, {'ok': True, 'code': room.code,
+                                        'phase': room.game['phase'],
+                                        'players': len(E.active_players(room.game))})
+
+        m = ROOM_PATH_RE.match(path)
+        if m:
+            code, sub = m.group(1).upper(), m.group(2) or ''
+            if sub in ('', '/host', '/board'):
+                # serve the shell even for unknown rooms — the client shows
+                # a friendly "room expired" message via the event stream
+                return self.serve_static('index.html')
+            if sub == '/events':
+                return self.serve_events(code, urllib.parse.parse_qs(url.query))
+            if sub == '/api/state':
+                q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
+                try:
+                    with LOCK:
+                        room = self.get_room(code)
+                        self.require_host(room, q)
+                        view = E.view_for(room.game, 'host', None,
+                                          {'now': now_ms(), 'joinUrl': room.join_url(),
+                                           'hostUrl': room.host_url(),
+                                           'roomCode': room.code,
+                                           'connections': room.connections()})
+                    return self.reply(200, view)
+                except E.GameError as e:
+                    return self.reply(ERROR_CODES.get(e.code, 400), {'error': str(e)})
         self.reply(404, {'error': 'Not found'})
 
     def serve_static(self, name):
@@ -267,19 +496,16 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
 
-    def serve_events(self, qs):
+    def serve_events(self, code, qs):
         params = {k: v[0] for k, v in qs.items()}
         role = params.get('role', 'player')
-        pid = None
-        if role == 'host':
-            if params.get('key') != HOST_KEY and not self.local_admin():
+        with LOCK:
+            room = ROOMS.get(code)
+            if room is not None and role == 'host' and params.get('key') != room.host_key:
                 return self.reply(403, {'error': 'Bad host key'})
-            kind = 'host'
-        elif role == 'board':
-            kind = 'board'
-        else:
-            kind = 'player'
-            pid = TOKENS.get(params.get('token') or '')
+            if room is not None and (total_clients() >= MAX_CLIENTS
+                                     or len(room.clients) >= MAX_CLIENTS_PER_ROOM):
+                return self.reply(503, {'error': 'The server is full right now.'})
 
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
@@ -289,20 +515,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        if kind == 'player' and not pid:
-            # Unknown/stale token: tell the client to re-join, then hang up.
+        def hang_up(err):
             try:
                 self.wfile.write(b'retry: 3000\n\n')
-                self.wfile.write(f'data: {json.dumps({"error": "bad-token"})}\n\n'.encode())
+                self.wfile.write(f'data: {json.dumps({"error": err})}\n\n'.encode())
                 self.wfile.flush()
             except OSError:
                 pass
-            return
 
-        client = Client(kind, pid)
+        if room is None:
+            return hang_up('no-room')
+        kind = role if role in ('host', 'board') else 'player'
+        token = params.get('token') or ''
+        pid = room.tokens.get(token) if kind == 'player' else None
+        if kind == 'player' and not pid:
+            return hang_up('bad-token')   # stale token: tell the client to re-join
+
+        client = Client(kind, pid, token)
         with LOCK:
-            CLIENTS.add(client)
-            broadcast()  # seeds this client and refreshes connection dots for everyone
+            if not room.alive():
+                return hang_up('no-room')
+            room.clients.add(client)
+            room.last_active = now_ms()
+            broadcast(room)  # seeds this client, refreshes connection dots for all
+
+        def revoked():
+            """Seat resumed on another device (or kicked/reset): this stream must end.
+
+            This is also the escape hatch for ghost connections — a dead phone's
+            stream can keep absorbing writes for many minutes, but the moment its
+            seat is claimed elsewhere the token rotates and we exit here."""
+            with LOCK:
+                return not room.alive() or (client.kind == 'player'
+                                            and room.tokens.get(client.token) != client.pid)
         try:
             self.wfile.write(b'retry: 1500\n\n')
             self.wfile.flush()
@@ -313,92 +558,130 @@ class Handler(BaseHTTPRequestHandler):
                 except queue.Empty:
                     self.wfile.write(b':hb\n\n')
                 self.wfile.flush()
+                if revoked():
+                    self.wfile.write(f'data: {json.dumps({"error": "superseded"})}\n\n'.encode())
+                    self.wfile.flush()
+                    break
         except (OSError, ValueError):
             pass
         finally:
             with LOCK:
-                CLIENTS.discard(client)
-                broadcast()
+                room.clients.discard(client)
+                if room.alive():
+                    room.last_active = now_ms()
+                    broadcast(room)
 
     # ---- POST
 
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
+        path = url.path.rstrip('/') or '/'
+        m = None
         try:
             body = self.read_json()
         except E.GameError as e:
             return self.reply(400, {'error': str(e)})
         try:
+            if path == '/api/rooms':
+                return self.h_create_room(body)
+            m = ROOM_PATH_RE.match(path)
             handler = {
                 '/api/join': self.h_join,
                 '/api/claim': self.h_claim,
                 '/api/quote': self.h_quote,
                 '/api/market': self.h_market,
                 '/api/host': self.h_host,
-            }.get(url.path)
+            }.get(m.group(2) or '') if m else None
             if not handler:
                 return self.reply(404, {'error': 'Not found'})
-            handler(body)
+            handler(m.group(1).upper(), body)
         except E.GameError as e:
-            code = 409 if e.code in ('taken',) else 403 if e.code == 'badkey' else 400
             out = {'error': str(e)}
             if e.code:
                 out['code'] = e.code
-            if e.code == 'taken':
+            if e.code in ('taken', 'started'):
+                # offer the "resume that seat" flow whenever the name matches a
+                # live seat — including mid-game, and even if the seat still looks
+                # connected (its old device may be dead without having hung up)
                 with LOCK:
-                    p = E.find_active_by_name(GAME, body.get('name'))
-                    out['canClaim'] = bool(p) and connections().get(p['id'], 0) == 0
-            self.reply(code, out)
+                    room = ROOMS.get((m.group(1) if m else '').upper())
+                    p = room and E.find_active_by_name(room.game, body.get('name'))
+                    out['canClaim'] = bool(p)
+            self.reply(ERROR_CODES.get(e.code, 400), out)
         except Exception as e:  # defensive: report instead of dropping the socket
             print(f'[gm] internal error: {e!r}', flush=True)
             self.reply(500, {'error': 'Internal error — check the server console.'})
 
-    def player_from(self, body):
-        pid = TOKENS.get(str(body.get('token') or ''))
+    def h_create_room(self, body):
+        if not allow(self.client_ip(), 'create'):
+            raise E.GameError('You are creating rooms too quickly — wait a minute.',
+                              code='rate')
+        with LOCK:
+            room = create_room()
+        print(f'[gm] room {room.code} created', flush=True)
+        self.reply(200, {'ok': True, 'code': room.code, 'hostKey': room.host_key,
+                         'joinUrl': room.join_url(), 'hostUrl': room.host_url()})
+
+    @staticmethod
+    def player_from(room, body):
+        pid = room.tokens.get(str(body.get('token') or ''))
         if not pid:
             raise E.GameError('Your session is stale — rejoin the game.', code='badtoken')
         return pid
 
-    def h_join(self, body):
+    def h_join(self, code, body):
+        if not allow(self.client_ip(), 'join'):
+            raise E.GameError('Too many join attempts — wait a minute.', code='rate')
         with LOCK:
-            p = E.add_player(GAME, body.get('name'), now_ms())
+            room = self.get_room(code)
+            p = E.add_player(room.game, body.get('name'), now_ms())
             token = secrets.token_hex(12)
-            TOKENS[token] = p['id']
-            touched()
+            room.tokens[token] = p['id']
+            touched(room)
         self.reply(200, {'token': token, 'pid': p['id'], 'name': p['name']})
 
-    def h_claim(self, body):
-        """Resume an existing seat from a new device (only while it is disconnected)."""
+    def h_claim(self, code, body):
+        """Resume an existing seat from a new device.
+
+        Deliberately allowed even while the seat looks connected: a phone that
+        died without closing its socket can look "connected" for many minutes,
+        and this is exactly the situation claiming exists for. Rotating the
+        tokens evicts the old stream (see revoked() in serve_events); a live
+        old device gets a 'superseded' notice and can claim right back."""
+        if not allow(self.client_ip(), 'join'):
+            raise E.GameError('Too many join attempts — wait a minute.', code='rate')
         with LOCK:
-            p = E.find_active_by_name(GAME, body.get('name'))
+            room = self.get_room(code)
+            p = E.find_active_by_name(room.game, body.get('name'))
             if not p:
                 raise E.GameError('No player by that name.')
-            if connections().get(p['id'], 0) > 0:
-                raise E.GameError('That seat is currently connected on another device.')
-            for t in [t for t, pid in TOKENS.items() if pid == p['id']]:
-                del TOKENS[t]
+            for t in [t for t, pid in room.tokens.items() if pid == p['id']]:
+                del room.tokens[t]
             token = secrets.token_hex(12)
-            TOKENS[token] = p['id']
-            E.note(GAME, f"{p['name']} reconnected from a new device", now_ms())
-            touched()
+            room.tokens[token] = p['id']
+            E.note(room.game, f"{p['name']} resumed their seat from a new device", now_ms())
+            touched(room)
         self.reply(200, {'token': token, 'pid': p['id'], 'name': p['name']})
 
-    def h_quote(self, body):
+    def h_quote(self, code, body):
         with LOCK:
-            pid = self.player_from(body)
-            result = E.submit_quote(GAME, pid, body, now_ms())
-            touched()
+            room = self.get_room(code)
+            pid = self.player_from(room, body)
+            result = E.submit_quote(room.game, pid, body, now_ms())
+            touched(room)
         self.reply(200, {'ok': True, **result})
 
-    def h_market(self, body):
+    def h_market(self, code, body):
         with LOCK:
-            pid = self.player_from(body)
+            room = self.get_room(code)
+            pid = self.player_from(room, body)
             req_id = str(body.get('reqId') or '')
-            cache = RECENT_REQ.setdefault(pid, OrderedDict())
+            cache = room.recent_req.setdefault(pid, OrderedDict())
             if req_id and req_id in cache:
                 return self.reply(200, cache[req_id])  # double-tap: same answer
-            result = E.market_order(GAME, pid, body.get('side'), body.get('size'), now_ms())
-            names = {p['id']: p['name'] for p in GAME['players'].values()}
+            result = E.market_order(room.game, pid, body.get('side'), body.get('size'),
+                                    now_ms())
+            names = {p['id']: p['name'] for p in room.game['players'].values()}
             out = {'ok': True, 'requested': result['requested'], 'filled': result['filled'],
                    'fills': [{'name': names.get(f['pid'], '—'), 'price': f['price'],
                               'size': f['size']} for f in result['fills']]}
@@ -406,55 +689,52 @@ class Handler(BaseHTTPRequestHandler):
                 cache[req_id] = out
                 while len(cache) > 16:
                     cache.popitem(last=False)
-            touched()
+            touched(room)
         self.reply(200, out)
 
-    def h_host(self, body):
+    def h_host(self, code, body):
         with LOCK:
-            self.require_host(body)
+            room = self.get_room(code)
+            self.require_host(room, body)
+            game = room.game
             action = body.get('action')
             now = now_ms()
             if action == 'settings':
-                E.set_settings(GAME, body.get('settings') or {}, now)
+                E.set_settings(game, body.get('settings') or {}, now)
             elif action == 'role':
-                E.set_role(GAME, body.get('pid'), body.get('role'), now)
+                E.set_role(game, body.get('pid'), body.get('role'), now)
             elif action == 'start':
-                E.start_game(GAME, now, RNG)
+                E.start_game(game, now, RNG)
             elif action == 'reveal':
-                E.reveal(GAME, now, RNG)
+                E.reveal(game, now, RNG)
             elif action == 'endMarket':
-                E.end_market(GAME, now)
+                E.end_market(game, now)
             elif action == 'next':
-                E.next_round(GAME, now)
+                E.next_round(game, now)
             elif action == 'settle':
-                E.settle(GAME, now)
+                E.settle(game, now)
             elif action == 'extend':
-                if GAME['phase'] not in ('quote', 'market'):
+                if game['phase'] not in ('quote', 'market'):
                     raise E.GameError('Nothing to extend right now.')
                 secs = max(5, min(300, int(body.get('seconds') or 30)))
-                GAME['deadline'] = (GAME['deadline'] or now) + secs * 1000
-                E.note(GAME, f'Host added {secs}s to the clock', now)
+                game['deadline'] = (game['deadline'] or now) + secs * 1000
+                E.note(game, f'Host added {secs}s to the clock', now)
             elif action == 'kick':
                 pid = body.get('pid')
-                E.kick_player(GAME, pid, now)
-                for t in [t for t, p in TOKENS.items() if p == pid]:
-                    del TOKENS[t]
+                E.kick_player(game, pid, now)
+                for t in [t for t, p in room.tokens.items() if p == pid]:
+                    del room.tokens[t]
             elif action == 'rematch':
-                E.rematch(GAME, now)
+                E.rematch(game, now)
             elif action == 'reset':
-                reset_game()
+                room.game = E.create_game()
+                room.tokens.clear()
+                room.recent_req.clear()
+                E.note(room.game, 'Fresh game created', now)
             else:
                 raise E.GameError('Unknown host action.')
-            touched()
+            touched(room)
         self.reply(200, {'ok': True})
-
-
-def reset_game():
-    global GAME, TOKENS
-    GAME = E.create_game()
-    TOKENS.clear()
-    RECENT_REQ.clear()
-    E.note(GAME, 'Fresh game created', now_ms())
 
 
 # ---------------------------------------------------------------- startup
@@ -471,8 +751,8 @@ def lan_ip():
 
 
 def main():
-    global JOIN_URL
-    load_snapshot()
+    global BASE_URL
+    load_rooms()
 
     want = os.environ.get('PORT')
     candidates = [int(want)] if want is not None else list(range(3000, 3011))
@@ -489,33 +769,36 @@ def main():
     server.daemon_threads = True
 
     port = server.server_address[1]
-    ip = lan_ip()
-    JOIN_URL = os.environ.get('JOIN_URL') or f'http://{ip}:{port}'
+    BASE_URL = (os.environ.get('JOIN_URL') or f'http://{lan_ip()}:{port}').rstrip('/')
     print(f'[gm] listening on http://127.0.0.1:{port}', flush=True)
-    print(f'[gm] host key: {HOST_KEY}', flush=True)
     line = '─' * 62
     print(f"""
 {line}
-  ♠♥  Glosten–Milgrom trading game v{VERSION} — the app is the exchange
+  ♠♥  Glosten–Milgrom trading game v{VERSION} — multi-room exchange
 
-  Players join:    {JOIN_URL}
-  Projector view:  {JOIN_URL}/board
-  Host controls:   http://localhost:{port}/host   (no key needed here)
-     from another device:  {JOIN_URL}/host?key={HOST_KEY}
+  Landing page:   {BASE_URL}
+     Create a room there — every room gets its own join code and
+     host key (saved automatically in the creator's browser).
 
-  Game state auto-saves to {os.path.basename(STATE_FILE)} (restart-safe).
-  Start over from scratch:  python3 server.py --fresh
+  Health check:   {BASE_URL}/healthz
+
+  Rooms snapshot to {STATE_DIR}{os.sep}<CODE>.json (restart-safe) and
+  expire after ~{ROOM_TTL_MS // 60_000} min idle. Start clean:  python3 server.py --fresh
 {line}
 """, flush=True)
 
     if '--open' in sys.argv:  # used by the double-click launchers
         import webbrowser
-        threading.Timer(0.8, lambda: webbrowser.open(f'http://localhost:{port}/host')).start()
+        threading.Timer(0.8, lambda: webbrowser.open(f'http://localhost:{port}/')).start()
 
     with LOCK:
-        rearm()  # resume a saved phase timer, if any
+        for room in ROOMS.values():
+            rearm(room)  # resume saved phase timers, if any
 
-    # a plain `kill` should also flush the game to disk before exiting
+    reaper = threading.Thread(target=reaper_loop, daemon=True)
+    reaper.start()
+
+    # a plain `kill` should also flush the rooms to disk before exiting
     def on_sigterm(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, on_sigterm)
@@ -525,7 +808,8 @@ def main():
         pass
     finally:
         with LOCK:
-            save_now()
+            for room in ROOMS.values():
+                save_room(room)
         print('\n[gm] state saved — bye', flush=True)
 
 

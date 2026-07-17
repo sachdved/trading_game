@@ -433,16 +433,97 @@ UNIT_TESTS = [test_cards, test_lobby_and_roles, test_deal, test_deal_full_pool,
               test_informed_axis, test_fee_and_anonymous, test_card_values]
 
 
+# ================================================================ multi-room units
+# (import the server module in-process to exercise rooms/reaper/rate limits
+# without HTTP — the module has no import-time side effects)
+
+def test_rooms_and_reaper():
+    tmp = tempfile.mkdtemp()
+    os.environ['STATE_DIR'] = tmp
+    import server as SRV
+    SRV.STATE_DIR = tmp   # in case the module was imported earlier with another env
+
+    with SRV.LOCK:
+        room = SRV.create_room()
+        code = room.code
+        SRV.save_room(room)
+    ok(re.fullmatch(r'[A-Z]{5}', code) and code in SRV.ROOMS, 'room created with a 5-letter code')
+    ok(all(ch in SRV.CODE_ALPHABET for ch in code), 'code avoids look-alike letters')
+    ok(os.path.exists(SRV.room_file(code)), 'room snapshot written')
+
+    SRV.reap_rooms(SRV.now_ms())
+    ok(code in SRV.ROOMS, 'fresh room is not reaped')
+
+    # an empty lobby expires on the short TTL
+    room.last_active = SRV.now_ms() - SRV.SETTLED_TTL_MS - 1000
+    SRV.reap_rooms(SRV.now_ms())
+    ok(code not in SRV.ROOMS, 'idle empty room reaped')
+    ok(not os.path.exists(SRV.room_file(code)), 'snapshot deleted on reap')
+
+    # a room with a live connection is never reaped, however old
+    with SRV.LOCK:
+        r2 = SRV.create_room()
+        r2.clients.add(SRV.Client('board'))
+        r2.last_active = SRV.now_ms() - SRV.ROOM_TTL_MS - 1000
+    SRV.reap_rooms(SRV.now_ms())
+    ok(r2.code in SRV.ROOMS, 'connected room survives past its TTL')
+    r2.clients.clear()
+    SRV.reap_rooms(SRV.now_ms())
+    ok(r2.code not in SRV.ROOMS, 'disconnected idle room reaped')
+
+    # live (mid-game) rooms use the LONG TTL, not the settled/empty one
+    with SRV.LOCK:
+        r3 = SRV.create_room()
+        E.add_player(r3.game, 'Zoe', NOW)
+        r3.game['phase'] = 'quote'
+        r3.last_active = SRV.now_ms() - SRV.SETTLED_TTL_MS - 60_000
+    SRV.reap_rooms(SRV.now_ms())
+    ok(r3.code in SRV.ROOMS, 'mid-game room outlives the short settled TTL')
+    r3.last_active = SRV.now_ms() - SRV.ROOM_TTL_MS - 1000
+    SRV.reap_rooms(SRV.now_ms())
+    ok(r3.code not in SRV.ROOMS, 'mid-game room reaped after the live TTL')
+
+    # per-IP rate limiter
+    SRV.RATE_LIMITS['create'] = (2, 60)
+    ok(SRV.allow('9.9.9.9', 'create'), 'first create allowed')
+    ok(SRV.allow('9.9.9.9', 'create'), 'second create allowed')
+    ok(not SRV.allow('9.9.9.9', 'create'), 'third create blocked')
+    ok(SRV.allow('8.8.4.4', 'create'), 'other IPs have their own bucket')
+    ok(all(SRV.allow('127.0.0.1', 'create') for _ in range(5)),
+       'loopback (operator browser / tunnel) is exempt from rate limits')
+
+    # client_ip: rightmost X-Forwarded-For hop, and only when TRUST_PROXY is on
+    class Stub:
+        headers = {'X-Forwarded-For': '6.6.6.6, 7.7.7.7'}
+        client_address = ('127.0.0.1', 1234)
+    old_tp = SRV.TRUST_PROXY
+    SRV.TRUST_PROXY = True
+    ok(SRV.Handler.client_ip(Stub()) == '7.7.7.7',
+       'client_ip uses the rightmost (proxy-appended) XFF hop')
+    SRV.TRUST_PROXY = False
+    ok(SRV.Handler.client_ip(Stub()) == '127.0.0.1', 'XFF ignored without TRUST_PROXY')
+    SRV.TRUST_PROXY = old_tp
+
+    # room cap
+    SRV.MAX_ROOMS = len(SRV.ROOMS)
+
+    def make():
+        with SRV.LOCK:
+            SRV.create_room()
+    expect_error(make, 'room limit')
+    SRV.MAX_ROOMS = 40
+
+
 # ================================================================ HTTP integration
 
 BASE = None
 
 
-def req(method, path, body=None, host_header=None):
+def req(method, path, body=None, headers=None):
     data = json.dumps(body).encode() if body is not None else None
-    headers = {'Content-Type': 'application/json'} if data else {}
-    if host_header:  # spoof a non-localhost Host to exercise real key auth
-        headers['Host'] = host_header
+    headers = dict(headers or {})
+    if data:
+        headers['Content-Type'] = 'application/json'
     r = urllib.request.Request(BASE + path, data=data, method=method, headers=headers)
     try:
         with urllib.request.urlopen(r, timeout=6) as resp:
@@ -453,9 +534,11 @@ def req(method, path, body=None, host_header=None):
         return e.code, json.loads(e.read())
 
 
-def spawn_server(state_file, fresh=True):
-    env = dict(os.environ, PORT='0', HOST_KEY='testkey', STATE_FILE=state_file,
-               PYTHONUNBUFFERED='1')
+def spawn_server(state_dir, fresh=True, extra_env=None):
+    env = dict(os.environ, PORT='0', STATE_DIR=state_dir, PYTHONUNBUFFERED='1',
+               JOIN_URL='http://game.test',
+               RATE_CREATES_PER_MIN='1000', RATE_JOINS_PER_MIN='1000')
+    env.update(extra_env or {})
     args = [sys.executable, 'server.py'] + (['--fresh'] if fresh else [])
     proc = subprocess.Popen(args, cwd=os.path.dirname(os.path.abspath(__file__)),
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -476,62 +559,144 @@ def spawn_server(state_file, fresh=True):
     return proc, port
 
 
+def sse_open(port, path):
+    """Open an SSE stream raw and keep the socket alive."""
+    s = socket.create_connection(('127.0.0.1', port), timeout=6)
+    s.sendall(f'GET {path} HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n'.encode())
+    s.settimeout(6)
+    return s
+
+
+def sse_read_until(s, want, limit=65536):
+    buf = b''
+    try:
+        while want not in buf and len(buf) < limit:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+    except socket.timeout:
+        pass
+    return buf
+
+
+def sse_snoop(port, path, want, limit=65536):
+    """Open an SSE stream, read until `want` (bytes) appears or it closes."""
+    s = sse_open(port, path)
+    buf = sse_read_until(s, want, limit)
+    s.close()
+    return buf
+
+
 def test_integration():
     global BASE
-    tmp = tempfile.mkdtemp()
-    state_file = os.path.join(tmp, 'state.json')
-    proc, port = spawn_server(state_file)
+    state_dir = tempfile.mkdtemp()
+    proc, port = spawn_server(state_dir)
     BASE = f'http://127.0.0.1:{port}'
     try:
-        # static views
-        for path in ('/', '/host', '/board'):
+        # landing page + static assets
+        for path in ('/', '/app.js', '/style.css'):
+            code, body = req('GET', path)
+            ok(code == 200, f'{path} serves')
+
+        # create two rooms
+        code, r1 = req('POST', '/api/rooms', {})
+        ok(code == 200 and re.fullmatch(r'[A-Z]{5}', r1['code']) and r1['hostKey'],
+           'room 1 created with code + host key')
+        ok(r1['joinUrl'] == f"http://game.test/r/{r1['code']}",
+           'join URL is built from JOIN_URL')
+        code, r2 = req('POST', '/api/rooms', {})
+        ok(code == 200 and r2['code'] != r1['code'], 'room 2 gets its own code')
+        A, KA = r1['code'], r1['hostKey']
+        B, KB = r2['code'], r2['hostKey']
+        bogus = next(c for c in ('ZZZZZ', 'YYYYY', 'XXXXX') if c not in (A, B))
+
+        # room views serve the app shell
+        for path in (f'/r/{A}', f'/r/{A}/host', f'/r/{A}/board'):
             code, body = req('GET', path)
             ok(code == 200 and b'app' in body, f'{path} serves the app shell')
-        code, _ = req('GET', '/app.js')
-        ok(code == 200, 'app.js served')
 
-        # host auth: real key checks apply to non-local requests…
-        code, _ = req('GET', '/api/state?key=wrong', host_header='game.example.com')
-        ok(code == 403, 'bad host key rejected for remote requests')
-        code, _ = req('GET', '/api/state?key=testkey', host_header='game.example.com')
-        ok(code == 200, 'correct key works for remote requests')
-        # …while the browser on the server machine itself needs no key
-        code, _ = req('GET', '/api/state?key=')
-        ok(code == 200, 'localhost browser is host without a key')
+        # room lookup endpoint (used by the join form)
+        code, d = req('GET', f'/api/rooms/{A}')
+        ok(code == 200 and d['code'] == A and d['phase'] == 'lobby', 'room lookup works')
+        code, d = req('GET', f'/api/rooms/{bogus}')
+        ok(code == 404 and d.get('code') == 'no-room', 'unknown room lookup 404s')
 
-        def host(action, **kw):
-            return req('POST', '/api/host', {'key': 'testkey', 'action': action, **kw})
+        # host auth is strictly per room — no localhost bypass anymore
+        code, _ = req('GET', f'/r/{A}/api/state?key=')
+        ok(code == 403, 'missing key is rejected even from localhost')
+        code, _ = req('GET', f'/r/{A}/api/state?key={KB}')
+        ok(code == 403, "room B's host key does not open room A")
+        code, _ = req('GET', f'/r/{A}/api/state?key={KA}')
+        ok(code == 200, "the room's own key works")
 
-        code, _ = host('settings', settings={'roles': 'everyone', 'quoteSeconds': 0,
-                                             'marketSeconds': 0, 'informedCount': 3,
-                                             'feePerUnit': 0, 'anonymous': False})
+        def host(rc, key, action, **kw):
+            return req('POST', f'/r/{rc}/api/host', {'key': key, 'action': action, **kw})
+
+        code, _ = host(B, KA, 'reveal')
+        ok(code == 403, 'cross-room host actions are rejected')
+
+        code, _ = host(A, KA, 'settings', settings={'roles': 'everyone', 'quoteSeconds': 0,
+                                                    'marketSeconds': 0, 'informedCount': 3,
+                                                    'feePerUnit': 0, 'anonymous': False})
         ok(code == 200, 'host can save settings')
-        code, st = req('GET', '/api/state?key=testkey')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['settings']['informedCount'] == 3, 'new settings round-trip')
 
-        # players join
+        # players join room A
         toks = {}
         for n in ('Ana', 'Bob', 'Cy'):
-            code, d = req('POST', '/api/join', {'name': n})
-            ok(code == 200 and d['token'], f'{n} joined')
+            code, d = req('POST', f'/r/{A}/api/join', {'name': n})
+            ok(code == 200 and d['token'], f'{n} joined room A')
             toks[n] = d['token']
-        code, d = req('POST', '/api/join', {'name': 'ana'})
+
+        # rooms are isolated: same name joins room B independently
+        code, dB = req('POST', f'/r/{B}/api/join', {'name': 'Ana'})
+        ok(code == 200, 'the same name can join a different room')
+        code, d = req('POST', f'/r/{B}/api/quote',
+                      {'token': toks['Ana'], 'bid': 1, 'bidSize': 1, 'ask': 2, 'askSize': 1})
+        ok(code == 400 and d.get('code') == 'badtoken', "room A's token is worthless in room B")
+        code, stB = req('GET', f'/r/{B}/api/state?key={KB}')
+        ok(len(stB['players']) == 1 and stB['phase'] == 'lobby',
+           'room B has only its own player')
+
+        # unknown room APIs 404 with a signal the client understands
+        code, d = req('POST', f'/r/{bogus}/api/join', {'name': 'X'})
+        ok(code == 404 and d.get('code') == 'no-room', 'joining a dead room 404s')
+
+        code, d = req('POST', f'/r/{A}/api/join', {'name': 'ana'})
         ok(code == 409 and d.get('code') == 'taken' and d.get('canClaim') is True,
            'name clash offers a seat claim when disconnected')
 
         # seat claim rotates the token
-        code, d = req('POST', '/api/claim', {'name': 'Ana'})
+        code, d = req('POST', f'/r/{A}/api/claim', {'name': 'Ana'})
         ok(code == 200, 'claim works while seat is disconnected')
         old_ana, toks['Ana'] = toks['Ana'], d['token']
 
-        code, _ = host('start')
+        code, _ = host(A, KA, 'start')
         ok(code == 200, 'game starts')
-        code, d = req('POST', '/api/join', {'name': 'Late'})
+        code, d = req('POST', f'/r/{A}/api/join', {'name': 'Late'})
         ok(code == 400 and d.get('code') == 'started', 'no joins after the deal')
 
-        code, d = req('POST', '/api/quote',
+        code, d = req('POST', f'/r/{A}/api/quote',
                       {'token': old_ana, 'bid': 1, 'bidSize': 1, 'ask': 2, 'askSize': 1})
         ok(code == 400, 'stale token rejected after claim')
+
+        # mid-game seat resume: a duplicate-name join offers the claim flow…
+        code, d = req('POST', f'/r/{A}/api/join', {'name': 'Bob'})
+        ok(code == 400 and d.get('code') == 'started' and d.get('canClaim') is True,
+           'mid-game duplicate-name join offers seat resume')
+        # …and claiming works even while the seat still LOOKS connected (dead
+        # phones keep their SSE stream alive for minutes) — the old stream is
+        # evicted with a 'superseded' notice
+        s_bob = sse_open(port, f"/r/{A}/events?role=player&token={toks['Bob']}")
+        sse_read_until(s_bob, b'"phase"')
+        code, d = req('POST', f'/r/{A}/api/claim', {'name': 'Bob'})
+        ok(code == 200 and d['token'], 'claim succeeds while the seat looks connected')
+        toks['Bob'] = d['token']
+        buf = sse_read_until(s_bob, b'superseded')
+        s_bob.close()
+        ok(b'superseded' in buf, "the old device's stream is evicted with a superseded notice")
 
         # round 1 quotes
         for name, q in {
@@ -539,15 +704,15 @@ def test_integration():
             'Bob': {'bid': 12, 'bidSize': 1, 'ask': 13, 'askSize': 1},
             'Cy': {'bid': 5, 'bidSize': 1, 'ask': 30, 'askSize': 1},
         }.items():
-            code, d = req('POST', '/api/quote', {'token': toks[name], **q})
+            code, d = req('POST', f'/r/{A}/api/quote', {'token': toks[name], **q})
             ok(code == 200, f'{name} quoted')
 
-        code, st = req('GET', '/api/state?key=testkey')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['phase'] == 'quote' and all(p['hasQuote'] for p in st['players']),
            'state shows all quotes in')
 
-        code, _ = host('reveal')
-        code, st = req('GET', '/api/state?key=testkey')
+        code, _ = host(A, KA, 'reveal')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['phase'] == 'market', 'reveal opens the market')
         ok(len(st['tape']) == 1 and st['tape'][0]['price'] == 12 and st['tape'][0]['size'] == 1
            and st['tape'][0]['buyer'] == 'Bob' and st['tape'][0]['seller'] == 'Ana',
@@ -555,28 +720,28 @@ def test_integration():
         ok([o['name'] for o in st['book']['asks']] == ['Ana', 'Bob', 'Cy'], 'asks rest sorted')
 
         # market orders (Cy lifts, then hits)
-        code, d = req('POST', '/api/market',
+        code, d = req('POST', f'/r/{A}/api/market',
                       {'token': toks['Cy'], 'side': 'buy', 'size': 2, 'reqId': 'r1'})
         ok(code == 200 and d['filled'] == 2, 'market buy filled')
         ok([(f['name'], f['price']) for f in d['fills']] == [('Ana', 12), ('Bob', 13)],
            'buy walked Ana then Bob')
-        code, d2 = req('POST', '/api/market',
+        code, d2 = req('POST', f'/r/{A}/api/market',
                        {'token': toks['Cy'], 'side': 'buy', 'size': 2, 'reqId': 'r1'})
         ok(code == 200 and d2 == d, 'duplicate reqId returns the cached fill (no double trade)')
 
-        code, d = req('POST', '/api/market',
+        code, d = req('POST', f'/r/{A}/api/market',
                       {'token': toks['Cy'], 'side': 'sell', 'size': 3, 'reqId': 'r2'})
         ok(code == 200 and d['filled'] == 2, 'sell partial-fills, skipping own bid')
         ok(all(f['name'] == 'Ana' and f['price'] == 10 for f in d['fills']), 'sold to Ana @ 10')
 
-        code, st = req('GET', '/api/state?key=testkey')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         cy = next(p for p in st['players'] if p['name'] == 'Cy')
         ok(cy['pos'] == 0 and cy['cash'] == -5, "Cy's book: -25 buys +20 sells")
 
         # close & settle
-        host('endMarket')
-        code, _ = host('settle')
-        code, st = req('GET', '/api/state?key=testkey')
+        host(A, KA, 'endMarket')
+        code, _ = host(A, KA, 'settle')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['phase'] == 'settled', 'settled')
         stl = st['settlement']
         pub = sum(E.card_points(c) for c in stl['publicCards'])
@@ -587,26 +752,29 @@ def test_integration():
                f"{r['name']}: total = cash + pos*V")
         ok(abs(sum(r['total'] for r in stl['rows'])) < 1e-9, 'zero-sum across players')
 
-        # SSE smoke test
-        s = socket.create_connection(('127.0.0.1', port), timeout=5)
-        s.sendall(b'GET /events?role=board HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n')
-        s.settimeout(5)
-        buf = b''
-        while b'"phase"' not in buf and len(buf) < 65536:
-            chunk = s.recv(4096)
-            if not chunk:
-                break
-            buf += chunk
-        s.close()
-        ok(b'text/event-stream' in buf and b'data: ' in buf and b'"settled"' in buf,
-           'SSE stream pushes the current state')
+        # room A's game did not leak into room B
+        code, stB = req('GET', f'/r/{B}/api/state?key={KB}')
+        ok(stB['phase'] == 'lobby' and not stB['tape'], 'room B is untouched by room A')
 
-        # persistence across restart. Wait for the debounced save to land first:
-        # on Windows terminate() kills without running the SIGTERM flush.
+        # SSE: room stream pushes state; unknown room says so
+        buf = sse_snoop(port, f'/r/{A}/events?role=board', b'"settled"')
+        ok(b'text/event-stream' in buf and b'data: ' in buf and b'"settled"' in buf,
+           'SSE stream pushes the room state')
+        buf = sse_snoop(port, f'/r/{bogus}/events?role=board', b'no-room')
+        ok(b'no-room' in buf, 'SSE for a dead room reports no-room')
+
+        # health endpoint for monitoring
+        code, h = req('GET', '/healthz')
+        ok(code == 200 and h['ok'] and h['rooms'] >= 2, 'healthz reports room count')
+
+        # persistence across restart (per-room snapshot files). Wait for the
+        # debounced save to land first: on Windows terminate() kills without
+        # running the SIGTERM flush.
+        room_a_file = os.path.join(state_dir, A + '.json')
         save_deadline = time.time() + 3
         while time.time() < save_deadline:
             try:
-                with open(state_file, encoding='utf-8') as f:
+                with open(room_a_file, encoding='utf-8') as f:
                     if json.load(f)['game']['phase'] == 'settled':
                         break
             except (OSError, ValueError, KeyError):
@@ -614,12 +782,15 @@ def test_integration():
             time.sleep(0.1)
         proc.terminate()
         proc.wait(timeout=5)
-        proc2, port2 = spawn_server(state_file, fresh=False)
+        proc2, port2 = spawn_server(state_dir, fresh=False)
         BASE = f'http://127.0.0.1:{port2}'
         try:
-            code, st2 = req('GET', '/api/state?key=testkey')
+            code, st2 = req('GET', f'/r/{A}/api/state?key={KA}')
             ok(st2['phase'] == 'settled' and st2['settlement']['V'] == stl['V'],
-               'game survives a server restart')
+               'room A survives a server restart')
+            code, st2 = req('GET', f'/r/{B}/api/state?key={KB}')
+            ok(code == 200 and st2['phase'] == 'lobby' and len(st2['players']) == 1,
+               'room B (and its host key) survive the restart too')
         finally:
             proc2.terminate()
             proc2.wait(timeout=5)
@@ -633,11 +804,66 @@ def test_integration():
                 proc.kill()
 
 
+def test_rate_limit_http():
+    """Limits key on the rightmost X-Forwarded-For hop (the proxy-appended one),
+    so spoofed leftmost entries cannot mint fresh buckets; unproxied loopback
+    (the tunnel / local-laptop case) is exempt."""
+    global BASE
+    proc, port = spawn_server(tempfile.mkdtemp(),
+                              extra_env={'RATE_CREATES_PER_MIN': '2', 'TRUST_PROXY': '1'})
+    BASE = f'http://127.0.0.1:{port}'
+    try:
+        codes = [req('POST', '/api/rooms', {},
+                     headers={'X-Forwarded-For': f'1.1.1.{i}, 9.9.9.9'})[0]
+                 for i in range(3)]
+        ok(codes == [200, 200, 429],
+           f'third create from one real IP is 429 despite spoofed XFF prefixes (got {codes})')
+        code, _ = req('POST', '/api/rooms', {},
+                      headers={'X-Forwarded-For': '1.1.1.9, 8.8.8.8'})
+        ok(code == 200, 'a different real client IP gets its own bucket')
+        codes = [req('POST', '/api/rooms', {})[0] for _ in range(3)]
+        ok(codes == [200, 200, 200],
+           'direct loopback traffic (tunnel case) is never rate limited')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def test_caps_http():
+    global BASE
+    proc, port = spawn_server(tempfile.mkdtemp(),
+                              extra_env={'MAX_ROOMS': '2', 'MAX_CLIENTS_PER_ROOM': '1'})
+    BASE = f'http://127.0.0.1:{port}'
+    try:
+        code1, r1 = req('POST', '/api/rooms', {})
+        code2, _ = req('POST', '/api/rooms', {})
+        code3, d = req('POST', '/api/rooms', {})
+        ok((code1, code2, code3) == (200, 200, 503) and d.get('code') == 'busy',
+           f'room cap returns 503 busy (got {(code1, code2, code3)})')
+        A = r1['code']
+        s1 = sse_open(port, f'/r/{A}/events?role=board')
+        buf = sse_read_until(s1, b'data: ')
+        ok(b'data: ' in buf, 'first SSE stream connects')
+        buf2 = sse_snoop(port, f'/r/{A}/events?role=board', b'full')
+        s1.close()
+        ok(b'503' in buf2 and b'full' in buf2, 'per-room SSE cap returns 503')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 # ================================================================ runner
 
 def main():
     failures = 0
-    for t in UNIT_TESTS + [test_integration]:
+    for t in UNIT_TESTS + [test_rooms_and_reaper, test_integration,
+                           test_rate_limit_http, test_caps_http]:
         try:
             t()
             print(f'  ✓ {t.__name__}')

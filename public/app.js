@@ -1,11 +1,21 @@
-/* Glosten–Milgrom trading game — client for player / host / board views. */
+/* Glosten–Milgrom trading game — client for landing / player / host / board views. */
 'use strict';
 
 /* ------------------------------------------------ constants & utils */
 
-const KIND = location.pathname.startsWith('/host') ? 'host'
-           : location.pathname.startsWith('/board') ? 'board' : 'player';
+/* URLs: /            landing (create or join a room)
+         /r/CODE      player view for room CODE
+         /r/CODE/host host view      /r/CODE/board  projector view */
+const ROOM_M = location.pathname.match(/^\/r\/([A-Za-z]{5})(?:\/(host|board))?\/?$/);
+const ROOM = ROOM_M ? ROOM_M[1].toUpperCase() : null;
+const KIND = ROOM ? (ROOM_M[2] || 'player') : 'landing';
 document.body.classList.add(KIND);
+
+const R = p => `/r/${ROOM}${p}`;                       // room-scoped URL
+const lsKey = k => `gm:${ROOM}:${k}`;                  // per-room localStorage
+const getTok = () => localStorage.getItem(lsKey('token')) || '';
+const setTok = t => localStorage.setItem(lsKey('token'), t);
+const delTok = () => localStorage.removeItem(lsKey('token'));
 
 const SUIT = { h: '♥', s: '♠', d: '♦', c: '♣' };
 const RED = { h: true, d: true };
@@ -83,7 +93,7 @@ let viewKey = '';        // what the current DOM layout was built for
 let skew = 0;            // serverNow - clientNow
 let lastFillSeen = null; // toast only fills newer than this
 let prevPhase = null, prevTapeMax = -1;
-let hostKey = localStorage.gmHostKey || '';
+let hostKey = ROOM ? (localStorage.getItem(lsKey('hostKey')) || '') : '';
 let soundOn = false, audioCtx = null;
 
 /* ------------------------------------------------ connection */
@@ -91,10 +101,10 @@ let soundOn = false, audioCtx = null;
 function connect() {
   if (es) es.close();
   const p = new URLSearchParams();
-  if (KIND === 'player') { p.set('role', 'player'); p.set('token', localStorage.gmToken || ''); }
+  if (KIND === 'player') { p.set('role', 'player'); p.set('token', getTok()); }
   if (KIND === 'host') { p.set('role', 'host'); p.set('key', hostKey); }
   if (KIND === 'board') p.set('role', 'board');
-  es = new EventSource('/events?' + p.toString());
+  es = new EventSource(R('/events') + '?' + p.toString());
   es.onmessage = e => {
     const d = JSON.parse(e.data);
     document.body.classList.remove('offline');
@@ -103,19 +113,39 @@ function connect() {
     skew = d.now - Date.now();
     render();
   };
-  es.onerror = () => document.body.classList.add('offline');
+  es.onerror = () => {
+    document.body.classList.add('offline');
+    // A non-200 response (e.g. 503 server-full) kills EventSource permanently —
+    // the browser only auto-retries network-level drops. Retry ourselves.
+    if (es && es.readyState === EventSource.CLOSED) {
+      setTimeout(() => { if (es && es.readyState === EventSource.CLOSED) connect(); }, 5000);
+    }
+  };
 }
 
 function handleErrorState(err) {
   if (es) es.close();
   document.body.classList.remove('offline');
-  if (err === 'bad-token' || err === 'reset') {
-    localStorage.removeItem('gmToken');
+  if (err === 'no-room') {
+    buildRoomGone();
+  } else if (err === 'superseded') {
+    delTok();
+    buildJoin('Your seat was resumed on another device. If that wasn’t you, resume it back.');
+  } else if (err === 'bad-token' || err === 'reset') {
+    delTok();
     buildJoin('That game is over — join the new one.');
   } else if (err === 'kicked') {
     $('app').innerHTML = `<div class="bigmsg"><h1>You were removed by the host</h1>
-      <p class="muted">You can watch on the <a href="/board">board view</a>.</p></div>`;
+      <p class="muted">You can watch on the <a href="${R('/board')}">board view</a>.</p></div>`;
   }
+}
+
+function buildRoomGone() {
+  if (es) es.close();
+  $('app').innerHTML = `<div class="bigmsg"><h1>This room doesn't exist</h1>
+    <p class="muted">The code may be wrong, or the room expired — rooms close after a
+    while with nobody connected.</p>
+    <p style="margin-top:18px"><a class="btn primary" href="/">Create or join a room</a></p></div>`;
 }
 
 /* ------------------------------------------------ rendering core */
@@ -402,6 +432,34 @@ function settlementHTML(S, { podium = false } = {}) {
 
 const BUILD = { player: buildPlayer, host: buildHost, board: buildBoard };
 
+/* ---------- landing (no room in the URL) ---------- */
+
+function buildLanding() {
+  $('app').innerHTML = `
+    <div class="wrap" style="padding-top:7vh">
+      <h1 class="center">♠♥ Trading game</h1>
+      <p class="center muted">Trading with imperfect information — a market game for phones</p>
+      <div class="panel">
+        <h2>Host a game</h2>
+        <p class="small muted">You get a 5-letter room code; friends join from their phones.
+        You run the rounds from the host panel.</p>
+        <button class="btn primary big" id="createbtn" data-action="create-room">Create a room</button>
+      </div>
+      <div class="panel">
+        <h2>Join a game</h2>
+        <form id="joinroomform">
+          <div class="field"><label>Room code</label>
+            <input type="text" id="j-code" maxlength="5" autocomplete="off" autocapitalize="characters"
+                   spellcheck="false" placeholder="ABCDE"
+                   style="text-transform:uppercase;letter-spacing:.35em;text-align:center;font-weight:800;font-size:1.25rem"></div>
+          <button class="btn big" type="submit">Join</button>
+        </form>
+        <div id="joinroommsg"></div>
+      </div>
+      <p class="footer-note"><a href="#" data-action="rules">How the game works</a></p>
+    </div>`;
+}
+
 /* ---------- player ---------- */
 
 function buildJoin(msg = '') {
@@ -409,7 +467,7 @@ function buildJoin(msg = '') {
   $('app').innerHTML = `
     <div class="wrap" style="padding-top:10vh">
       <h1 class="center">♠♥ Trading game</h1>
-      <p class="center muted">Trading with imperfect information</p>
+      <p class="center muted">Room <b>${esc(ROOM)}</b> — trading with imperfect information</p>
       <div class="panel">
         ${msg ? `<p class="muted">${esc(msg)}</p>` : ''}
         <form id="joinform">
@@ -420,7 +478,8 @@ function buildJoin(msg = '') {
         </form>
         <div id="joinmsg"></div>
       </div>
-      <p class="footer-note">Watching on the projector? Open <a href="/board">/board</a>.</p>
+      <p class="footer-note">Watching on the projector? Open <a href="${R('/board')}">the board view</a>.
+      Wrong room? <a href="/">Start over</a>.</p>
     </div>`;
 }
 
@@ -535,7 +594,7 @@ function buildPlayer(S) {
 }
 
 function prefillQuote() {
-  const q = S.me.quote || JSON.parse(localStorage.gmLastQuote || 'null');
+  const q = S.me.quote || JSON.parse(localStorage.getItem(lsKey('lastQuote')) || 'null');
   if (!q) return;
   if ($('q-bid')) {
     $('q-bid').value = q.bid; $('q-bidsize').value = q.bidSize;
@@ -548,16 +607,18 @@ function prefillQuote() {
 function buildHostKeyForm(msg = '') {
   $('app').innerHTML = `
     <div class="wrap" style="padding-top:10vh">
-      <h1 class="center">Host controls</h1>
+      <h1 class="center">Host controls — room ${esc(ROOM)}</h1>
       <div class="panel">
         ${msg ? `<p class="muted">${esc(msg)}</p>` : ''}
         <form id="hostkeyform">
-          <div class="field"><label>Host key (printed in the server terminal)</label>
-            <input type="text" id="h-key" autocomplete="off" placeholder="e.g. 3f9a2c1b"></div>
+          <div class="field"><label>Host key (issued when the room was created)</label>
+            <input type="text" id="h-key" autocomplete="off" placeholder="e.g. 3f9a2c1b0d4e5f6a"></div>
           <button class="btn primary big" type="submit">Open host panel</button>
         </form>
-        <p class="small muted">Tip: on the computer that runs the game, just open
-          <b>http://localhost:3000/host</b> — no key needed there.</p>
+        <p class="small muted">The browser that created this room saved the key automatically.
+        On another device, open the <b>host link</b> from that browser's panel (it carries
+        <b>?key=…</b>), or paste the key here. Joining as a player instead?
+        <a href="${R('')}">Go to the player view</a>.</p>
       </div>
     </div>`;
 }
@@ -627,9 +688,13 @@ function buildHost(S) {
     const s = S.settings;
     left = `
       <div class="panel">
-        <h2>Game setup</h2>
-        <p class="small muted">Players join at <b id="joinurl"></b> — put <a href="/board" target="_blank">/board</a> on the projector.</p>
-        ${S.hostUrl ? `<p class="small muted">Host controls from another device: ${esc(S.hostUrl)}</p>` : ''}
+        <h2>Room <span style="letter-spacing:.12em">${esc(ROOM)}</span></h2>
+        <p class="small muted">Players join at <b id="joinurl"></b> — put
+          <a href="${R('/board')}" target="_blank">the board view</a> on the projector/TV.</p>
+        <div class="actionsrow">
+          <button class="btn mini" data-action="copy-invite">📋 Copy invite link</button>
+          <button class="btn mini" data-action="copy-hosturl">Copy host link (for another device)</button>
+        </div>
         ${hostActions(S)}
       </div>
       <div class="panel"><h3>Players</h3><div id="roster"></div></div>`;
@@ -705,7 +770,9 @@ function buildHost(S) {
 /* ---------- board ---------- */
 
 function buildBoard(S) {
-  const head = topbarHTML(S, `<button class="btn mini" id="soundbtn" data-action="sound">🔇 sound</button>`);
+  const head = topbarHTML(S,
+    `<span class="chip">room <b style="letter-spacing:.12em">${esc(ROOM)}</b></span>
+     <button class="btn mini" id="soundbtn" data-action="sound">🔇 sound</button>`);
   let main = '';
 
   if (S.phase === 'lobby') {
@@ -768,24 +835,33 @@ document.addEventListener('submit', async e => {
   e.preventDefault();
   const f = e.target;
   try {
-    if (f.id === 'joinform') {
+    if (f.id === 'joinroomform') {
+      const code = $('j-code').value.trim().toUpperCase();
+      if (!/^[A-Z]{5}$/.test(code)) {
+        $('joinroommsg').innerHTML = '<p class="muted">Room codes are 5 letters — check the board or ask your host.</p>';
+        return;
+      }
+      const r = await fetch('/api/rooms/' + code);
+      if (r.ok) location.href = `/r/${code}`;
+      else $('joinroommsg').innerHTML = `<p class="muted">No room <b>${esc(code)}</b> — check the code with your host (rooms expire after a while).</p>`;
+    } else if (f.id === 'joinform') {
       const name = $('j-name').value;
       try {
-        const d = await api('/api/join', { name });
-        localStorage.gmToken = d.token; localStorage.gmName = d.name;
+        const d = await api(R('/api/join'), { name });
+        setTok(d.token); localStorage.gmName = d.name;
         connect();
       } catch (err) {
-        if (err.code === 'taken' && err.canClaim) {
-          $('joinmsg').innerHTML = `<p class="muted">Someone named <b>${esc(name)}</b> is in the game but
-            not connected. Is that you?</p>
+        if ((err.code === 'taken' || err.code === 'started') && err.canClaim) {
+          $('joinmsg').innerHTML = `<p class="muted">Someone named <b>${esc(name)}</b> is already in
+            this game. Is that you? Resuming moves the seat to this device.</p>
             <button class="btn big" data-action="claim" data-name="${esc(name)}">Resume that seat</button>`;
         } else throw err;
       }
     } else if (f.id === 'quoteform') {
       const q = { bid: $('q-bid').value, bidSize: $('q-bidsize').value,
                   ask: $('q-ask').value, askSize: $('q-asksize').value };
-      await api('/api/quote', { token: localStorage.gmToken, ...q });
-      localStorage.gmLastQuote = JSON.stringify(q);
+      await api(R('/api/quote'), { token: getTok(), ...q });
+      localStorage.setItem(lsKey('lastQuote'), JSON.stringify(q));
       toast('Quote submitted ✓');
     } else if (f.id === 'settingsform') {
       // both the lobby form and the live-tweaks form share this handler;
@@ -800,7 +876,7 @@ document.addEventListener('submit', async e => {
       if ($('set-anon')) st.anonymous = $('set-anon').value === 'on';
       if ($('set-cv-A')) st.cardValues = Object.fromEntries(
         ['A', 'K', 'Q', 'J'].map(r => [r, +$('set-cv-' + r).value]));
-      await api('/api/host', { key: hostKey, action: 'settings', settings: st });
+      await api(R('/api/host'), { key: hostKey, action: 'settings', settings: st });
       toast('Settings saved ✓');
     } else if (f.id === 'hostkeyform') {
       tryHostKey($('h-key').value.trim());
@@ -815,9 +891,23 @@ document.addEventListener('click', async e => {
   try {
     if (a === 'rules') showRules();
     else if (a === 'modal-close') $('modal').classList.add('hidden');
-    else if (a === 'claim') {
-      const d = await api('/api/claim', { name: el.dataset.name });
-      localStorage.gmToken = d.token; localStorage.gmName = d.name;
+    else if (a === 'create-room') {
+      el.disabled = true;
+      try {
+        const d = await api('/api/rooms', {});
+        localStorage.setItem(`gm:${d.code}:hostKey`, d.hostKey);
+        location.href = `/r/${d.code}/host`;
+      } finally { el.disabled = false; }
+    } else if (a === 'copy-invite' || a === 'copy-hosturl') {
+      const text = a === 'copy-invite' ? S?.joinUrl : S?.hostUrl;
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        toast('Link copied ✓');
+      } catch { prompt('Copy this link:', text); }
+    } else if (a === 'claim') {
+      const d = await api(R('/api/claim'), { name: el.dataset.name });
+      setTok(d.token); localStorage.gmName = d.name;
       connect();
     } else if (a === 'size-dec' || a === 'size-inc') {
       const inp = $('msize');
@@ -825,8 +915,8 @@ document.addEventListener('click', async e => {
     } else if (a === 'mkt-buy' || a === 'mkt-sell') {
       el.disabled = true;
       setTimeout(() => { if (S?.phase === 'market') el.disabled = false; }, 450);
-      const d = await api('/api/market', {
-        token: localStorage.gmToken, side: a === 'mkt-buy' ? 'buy' : 'sell',
+      const d = await api(R('/api/market'), {
+        token: getTok(), side: a === 'mkt-buy' ? 'buy' : 'sell',
         size: +$('msize').value, reqId: Math.random().toString(36).slice(2) });
       const parts = d.fills.map(f => `${f.size} @ ${fmt(f.price)} (${esc(f.name)})`).join(', ');
       const short = d.filled < d.requested ? ` — only ${d.filled}/${d.requested}, the book ran dry` : '';
@@ -835,12 +925,12 @@ document.addEventListener('click', async e => {
       if (el.dataset.confirm && !confirm(el.dataset.confirm)) return;
       const body = { key: hostKey, action: el.dataset.cmd };
       if (el.dataset.cmd === 'extend') body.seconds = 30;
-      await api('/api/host', body);
+      await api(R('/api/host'), body);
     } else if (a === 'host-role') {
-      await api('/api/host', { key: hostKey, action: 'role', pid: el.dataset.pid, role: el.dataset.role });
+      await api(R('/api/host'), { key: hostKey, action: 'role', pid: el.dataset.pid, role: el.dataset.role });
     } else if (a === 'host-kick') {
       if (!confirm(`Remove ${el.dataset.name} from the game?`)) return;
-      await api('/api/host', { key: hostKey, action: 'kick', pid: el.dataset.pid });
+      await api(R('/api/host'), { key: hostKey, action: 'kick', pid: el.dataset.pid });
     } else if (a === 'sound') {
       soundOn = !soundOn;
       el.textContent = soundOn ? '🔊 sound' : '🔇 sound';
@@ -914,27 +1004,29 @@ if (KIND === 'player') {
 /* ------------------------------------------------ init */
 
 async function tryHostKey(key) {
+  if (!key) return buildHostKeyForm();
   try {
-    const r = await fetch('/api/state?key=' + encodeURIComponent(key));
-    if (!r.ok) throw new Error(key ? 'That key does not match — check the server terminal.' : '');
+    const r = await fetch(R('/api/state') + '?key=' + encodeURIComponent(key));
+    if (r.status === 404) return buildRoomGone();
+    if (!r.ok) throw new Error('That key does not match this room.');
     hostKey = key;
-    localStorage.gmHostKey = key;
-    history.replaceState(null, '', '/host');
+    localStorage.setItem(lsKey('hostKey'), key);
+    history.replaceState(null, '', R('/host'));   // strip ?key=… from the URL bar
     connect();
   } catch (err) {
     buildHostKeyForm(err.message);
   }
 }
 
-if (KIND === 'host') {
+if (KIND === 'landing') {
+  buildLanding();
+} else if (KIND === 'host') {
   const urlKey = new URL(location.href).searchParams.get('key');
-  if (urlKey) tryHostKey(urlKey);
-  else if (hostKey) tryHostKey(hostKey);
-  else tryHostKey('');   // no key needed when this browser runs on the server machine
+  tryHostKey(urlKey || hostKey);
 } else if (KIND === 'player') {
   const m = location.hash.match(/^#t=([0-9a-f]{8,})$/);   // token hand-off link
-  if (m) { localStorage.gmToken = m[1]; history.replaceState(null, '', '/'); }
-  if (localStorage.gmToken) connect();
+  if (m) { setTok(m[1]); history.replaceState(null, '', R('')); }
+  if (getTok()) connect();
   else buildJoin();
 } else {
   connect();

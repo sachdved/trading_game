@@ -3,7 +3,7 @@
 This is the operator/developer companion to [README.md](README.md). It covers three
 things: putting the game on the web, changing the exchange's rules, and the design for
 **informed vs. uninformed traders** (a separate axis from market maker vs. liquidity
-taker — specced below, not yet implemented).
+taker — built in as the `informedCount` host setting; see section 3).
 
 ---
 
@@ -22,39 +22,46 @@ Everything below is only for putting a copy on the actual internet.
 
 The architecture dictates the deployment shape, so read this first:
 
-- **One process, one instance.** All game state lives in the memory of a single
-  `server.py` process (with a JSON snapshot on disk). Never run 2+ replicas or workers
-  behind a load balancer — players would land on different games.
+- **One process, one instance — many rooms.** The server hosts any number of
+  independent rooms (each a 5-letter code, its own game and host key), but all of them
+  live in the memory of a single `server.py` process (with per-room JSON snapshots on
+  disk). Never run 2+ replicas or workers behind a load balancer — players would land
+  on different copies of their room.
 - **Always-on.** Clients hold open Server-Sent-Events connections and phase timers run
-  server-side. "Scale-to-zero" / free tiers that sleep on idle will pause the game
+  server-side. "Scale-to-zero" / free tiers that sleep on idle will pause games
   mid-round. Use an always-on tier.
 - **Plain HTTP/1.1, no WebSockets.** Any reverse proxy works if it doesn't buffer
   streaming responses (see proxy notes). The app heartbeats every 15s, so ordinary
   60s idle timeouts are fine.
 - **HTTPS strongly preferred** for anything off your LAN (phones trust it, and the
   screen wake-lock feature only works in secure contexts).
-- **Capacity:** one thread per connected client; comfortable to ~50 players / ~100
-  connections. It is a classroom game, not a hardened public service — host it for the
-  duration of an event, behind an unguessable URL, and tear it down or reset after.
+- **Capacity:** one thread per connected client; comfortable to a few hundred
+  concurrent connections across all rooms (the default caps below stop it well before
+  it hurts). It is a party/classroom game, not a hardened public service.
+- **Housekeeping is built in:** rooms with nobody connected expire (~2 h idle, ~30 min
+  once settled or never used), snapshots are deleted with them, and room creation /
+  joining is rate-limited per IP.
 
 ### Environment contract
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | 3000 (tries 3000–3010; `0` = random) | listen port |
-| `HOST_KEY` | random per fresh game | set it explicitly in production so your host link survives restarts and redeploys |
-| `JOIN_URL` | `http://<lan-ip>:<port>` | the URL shown to players on the board/banner — set to your public URL |
-| `STATE_FILE` | `./state.json` | snapshot path; put it on a persistent volume if you want games to survive restarts |
-| `--fresh` (flag) | — | ignore any existing snapshot on boot |
-| `--open` (flag) | — | open the host panel in the default browser after startup (what the double-click launchers pass) |
+| `JOIN_URL` | `http://<lan-ip>:<port>` | public base URL used in every join/host link — set it to your domain in production |
+| `STATE_DIR` | `./state` | per-room snapshots (`<CODE>.json`); put it on a persistent volume if you want rooms to survive restarts |
+| `TRUST_PROXY` | off | set `1` behind a reverse proxy so rate limits key on the **rightmost** `X-Forwarded-For` hop (the one your proxy appended — spoof-proof) instead of the proxy's IP |
+| `MAX_ROOMS` | 40 | concurrent rooms; creation returns 503 beyond this |
+| `MAX_CLIENTS` / `MAX_CLIENTS_PER_ROOM` | 400 / 120 | SSE connection caps (server-wide / per room) |
+| `RATE_CREATES_PER_MIN` / `RATE_JOINS_PER_MIN` | 5 / 30 | per-IP rate limits (0 disables); direct loopback traffic (the operator's browser, or a whole classroom behind a cloudflared/ngrok tunnel) is exempt |
+| `ROOM_TTL_MINUTES` / `SETTLED_TTL_MINUTES` | 120 / 30 | idle lifetimes for live rooms / finished-or-empty rooms |
+| `--fresh` (flag) | — | discard all saved room snapshots on boot |
+| `--open` (flag) | — | open the landing page in the default browser after startup (what the double-click launchers pass) |
 
-**Host auth:** a browser on the server machine itself is host **without a key** — the
-check requires both a loopback peer *and* a `localhost` Host header, which is what the
-double-click launchers rely on. Tunnels (cloudflared/ngrok) also connect from loopback
-but forward the public hostname in the Host header, so tunneled traffic still needs
-`?key=…`. Corollary for shared machines: anyone who can browse `localhost:3000` on the
-server box is the host — on a multi-user box, front it with a proxy and only expose
-the proxy.
+**Host auth is per room.** Creating a room returns its host key; the creator's browser
+stores it and is let straight into `/r/CODE/host`. From any other device, use the
+room's *Copy host link* button (the link carries `?key=…`). There is **no**
+localhost/operator bypass: the machine the server runs on has no special powers over
+rooms, which is exactly what you want on a shared public box.
 
 ### Option A — tunnel from your laptop (best for a one-off session)
 
@@ -70,7 +77,8 @@ JOIN_URL=https://<random>.trycloudflare.com python3 server.py
 
 Pros: free, instant, HTTPS included, works for Zoom-remote players. Cons: your laptop
 must stay awake and on the network; the URL changes every run. (ngrok or
-`tailscale serve` work the same way.)
+`tailscale serve` work the same way.) Rooms created before the `JOIN_URL` restart show
+stale links — create rooms after it.
 
 ### Option B — container platform (Fly.io / Railway / Render / anything)
 
@@ -101,7 +109,8 @@ app = "gm-trading-game"
 
 [env]
   PORT = "3000"
-  STATE_FILE = "/data/state.json"
+  STATE_DIR = "/data/state"
+  TRUST_PROXY = "1"
   JOIN_URL = "https://gm-trading-game.fly.dev"
 
 [mounts]
@@ -112,12 +121,11 @@ app = "gm-trading-game"
 ```bash
 fly launch --no-deploy          # then paste the toml above
 fly volumes create gmdata --size 1
-fly secrets set HOST_KEY=<something-long>
 fly deploy && fly scale count 1 # exactly one machine
 ```
 
 Platform gotchas: **Render's free tier sleeps on idle** (breaks the game — use a paid
-always-on instance and attach a persistent disk for `STATE_FILE`); Railway is fine on
+always-on instance and attach a persistent disk for `STATE_DIR`); Railway is fine on
 any always-on plan (set the env vars in the dashboard, keep 1 replica).
 
 ### Option C — small VPS or an internal VM (systemd + Caddy)
@@ -134,9 +142,9 @@ After=network.target
 WorkingDirectory=/opt/trading-game
 ExecStart=/usr/bin/python3 /opt/trading-game/server.py
 Environment=PORT=3000
-Environment=HOST_KEY=change-me-to-something-long
 Environment=JOIN_URL=https://game.example.com
-Environment=STATE_FILE=/var/lib/trading-game/state.json
+Environment=STATE_DIR=/var/lib/trading-game
+Environment=TRUST_PROXY=1
 DynamicUser=yes
 StateDirectory=trading-game
 Restart=on-failure
@@ -170,12 +178,15 @@ location / {
 ### Go-live checklist
 
 - [ ] Exactly **one** instance/replica, on an **always-on** tier
-- [ ] `HOST_KEY` set explicitly (and kept secret — it is the only admin auth)
-- [ ] `JOIN_URL` set to the public URL (it's what the projector shows)
-- [ ] `STATE_FILE` on a persistent volume *if* you want restart-resume (optional)
+- [ ] `JOIN_URL` set to the public URL (it's what every join/host link is built from)
+- [ ] `TRUST_PROXY=1` if a reverse proxy or platform edge sits in front
+- [ ] `STATE_DIR` on a persistent volume *if* you want rooms to survive restarts (optional)
 - [ ] HTTPS in front (platform or Caddy)
-- [ ] After each event: host panel **Reset game**, or redeploy with `--fresh`
-- [ ] Remember anyone with the URL can join as a player — share it at game time
+- [ ] Point an uptime monitor at `/healthz` (reports room/client counts)
+- [ ] Deploys drop in-memory rooms not yet snapshotted — prefer deploying when
+      `/healthz` shows few rooms
+- [ ] Remember anyone with the URL can create rooms and join them — that's the point,
+      but the per-IP rate limits and `MAX_ROOMS` are your abuse valves
 
 ---
 
@@ -188,8 +199,10 @@ The separation of concerns is strict, which is what makes rule-hacking safe:
 - **`engine.py`** — every game rule, as small functions over one JSON-able `game` dict.
   No I/O, no clocks (`now` and `rng` are always passed in). *This is the only file you
   touch to change how the market works.*
-- **`server.py`** — transport only: HTTP, SSE fan-out, the phase timer, snapshots,
-  auth. It calls engine functions under a lock and never interprets rules.
+- **`server.py`** — transport only: HTTP, SSE fan-out, the room registry, phase
+  timers, snapshots, auth, rate limits. It calls engine functions under a lock and
+  never interprets rules. Every room is an independent game dict, so rule changes in
+  `engine.py` apply to all rooms alike.
 - **`public/app.js`** — rendering only; it draws whatever state the server pushes.
   You touch it only when a new rule needs a knob or a display.
 - **`tests.py`** — run `python3 tests.py` after *every* rule change; the matching,
@@ -260,13 +273,13 @@ touch points in the code as the reference example. The same steps apply to any k
   resume breaks.
 - **Serializability:** the `game` dict must stay `json.dumps`-able (no sets, objects,
   tuples-as-keys) or snapshots and SSE break.
-- **Locking:** any new server endpoint mutating state must do so inside `with LOCK:`
-  and finish with `touched()`.
+- **Locking:** any new server endpoint mutating a room must do so inside `with LOCK:`
+  and finish with `touched(room)`.
 
 ### Snapshot compatibility
 
-`state.json` is a dump of the game dict. After changing the state *shape*, old
-snapshots may lack your new keys — either read them defensively
+Each `state/<CODE>.json` is a dump of that room's game dict. After changing the state
+*shape*, old snapshots may lack your new keys — either read them defensively
 (`settings.get('feePerUnit', 0)`) or just restart with `--fresh` after deploying a
 rules change. Mid-game rule upgrades are not worth supporting.
 

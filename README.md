@@ -20,19 +20,22 @@ One person hosts on a laptop; everyone else joins from their phone **on the same
      *Open*, since it's a downloaded script)
    - **Windows:** double-click `start-trading-game.bat`
    - **any terminal:** `python3 server.py`
-4. Your browser opens the **host panel** by itself (launchers only — otherwise open
-   `http://localhost:3000/host`; no key needed on the hosting computer). If the OS asks
-   to allow incoming connections, allow it.
-5. Put the **board view** on the TV/projector — it shows the join address in huge type;
-   players type it into their phones and enter a name.
+4. Your browser opens the **game page** by itself (launchers only — otherwise open
+   `http://localhost:3000`). Click **Create a room** — you land in the host panel and
+   get a 5-letter **room code** (say `KFQTR`). If the OS asks to allow incoming
+   connections, allow it.
+5. Put the **board view** on the TV/projector — it shows the join address (with the
+   room code) in huge type; players type it into their phones and enter a name.
 
-The three URLs (also printed in the terminal):
+The server can host **many rooms at once** — friends can even run their own game in a
+second room on the same laptop. The URLs:
 
 | URL | Who opens it |
 |---|---|
-| `http://<laptop-ip>:3000` | **Players**, on their phones (same wifi) |
-| `http://<laptop-ip>:3000/board` | **TV / projector** — public info only, big type |
-| `http://localhost:3000/host` | **The host**, on the hosting laptop (key-free there); from another device use the `/host?key=…` link from the terminal or the host panel |
+| `http://<laptop-ip>:3000` | The **landing page** — create a room, or join one by code |
+| `http://<laptop-ip>:3000/r/KFQTR` | **Players**, on their phones (same wifi) |
+| `http://<laptop-ip>:3000/r/KFQTR/board` | **TV / projector** — public info only, big type |
+| `http://<laptop-ip>:3000/r/KFQTR/host` | **The host.** The browser that created the room is let in automatically; from another device use the room's *Copy host link* button (it carries `?key=…`) |
 
 > **Wifi gotchas:** everyone must be on the *same* network, and guest/hotel/corporate
 > wifi often blocks phone-to-laptop traffic ("client isolation"). If phones can't load
@@ -41,7 +44,7 @@ The three URLs (also printed in the terminal):
 
 ## Running a session (host script)
 
-1. Open the host panel and put `/board` on the projector.
+1. Create a room, open its host panel, and put the room's board view on the projector.
 2. In the lobby, pick settings (defaults are sensible) and flip anyone's role if you like.
 3. **Deal cards & start round 1.** Everyone sees the 3 public cards; each player sees
    their own private card on their phone.
@@ -120,23 +123,27 @@ players and the board see.
 
 - **Reconnects:** phones can sleep/refresh freely — sessions resume automatically. If
   someone's device dies, they can rejoin from a new device with the same name ("resume
-  seat"), as long as the old device is offline.
-- **Crash-safe:** state auto-saves to `state.json`; restarting `python3 server.py`
-  resumes mid-game (timers included). Start over with `python3 server.py --fresh`,
-  or the host panel's *Reset game*.
+  seat") — even if the dead device still *looks* connected. The seat moves to the new
+  device; the old one (if actually alive) is told and can resume it right back.
+- **Crash-safe:** every room auto-saves to `state/<CODE>.json`; restarting
+  `python3 server.py` resumes all rooms mid-game (timers included). Start over with
+  `python3 server.py --fresh`, or a room's *Reset game* button.
+- **Rooms expire** after ~2 hours with nobody connected (~30 min once settled or if
+  never used) — so a public server tidies up after itself.
 - **Late arrivals** can't join after the deal (V is fixed by the dealt cards) — they can
-  watch `/board`.
+  watch the board view.
 - **Kicking** someone mid-game keeps their dealt card in V (the card was dealt), pulls
   their resting orders, and freezes their P&L.
 - **Remote players:** the join URL only works on your network. For remote folks,
   tunnel it: `brew install cloudflared && cloudflared tunnel --url http://localhost:3000`
-  (or ngrok / Tailscale) and set `JOIN_URL=https://…` when starting the server so the
-  board shows the right link. (When tunneled, host controls need the `?key=…` link —
-  the key-free localhost login deliberately stays off for tunneled traffic.) For real
-  web hosting, see [EXTENDING.md](EXTENDING.md).
-- Env vars: `PORT` (default 3000, tries 3000–3010), `HOST_KEY`, `JOIN_URL`, `STATE_FILE`.
-- This is a friendly living-room/classroom game, not a hardened service — run it on a
-  trusted network.
+  (or ngrok / Tailscale) and set `JOIN_URL=https://…` when starting the server so
+  boards show the right links. For real web hosting — your own always-on server where
+  anyone can create a room, Among Us-style — see **[MULTIROOM.md](MULTIROOM.md)**.
+- Env vars: `PORT` (default 3000, tries 3000–3010), `JOIN_URL`, `STATE_DIR`, plus the
+  operator knobs in [EXTENDING.md](EXTENDING.md) (rate limits, caps, TTLs,
+  `TRUST_PROXY`).
+- Each room's host key is its only admin credential — the creator's browser stores it
+  automatically; share it only via the *Copy host link* button.
 
 ## Sharing it with friends
 
@@ -155,18 +162,25 @@ python3 tests.py    # engine unit tests + a full game driven over HTTP
 
 ## Hosting it, changing the rules, informed traders
 
-See **[EXTENDING.md](EXTENDING.md)** — deployment recipes (tunnel / Fly.io / VPS), a
-map of where every exchange rule lives so you can manipulate the mechanics, and the
-informed vs. uninformed trader mechanic (now built in as a host setting).
+- **[MULTIROOM.md](MULTIROOM.md)** — put it on the internet as a multi-room service
+  (anyone opens your URL, creates a room, plays with friends), with step-by-step
+  deployment for Fly.io and a VPS.
+- **[EXTENDING.md](EXTENDING.md)** — the operator env-var contract, deployment
+  recipes, a map of where every exchange rule lives so you can manipulate the
+  mechanics, and the informed vs. uninformed trader mechanic (built in as a host
+  setting).
 
 ## Files
 
 ```
-server.py                    HTTP + Server-Sent-Events server, timers, persistence
+server.py                    multi-room HTTP + Server-Sent-Events server, timers,
+                             room registry, rate limits, per-room persistence
 engine.py                    game rules: dealing, matching, market orders, scoring
-public/                      the web client (player / host / board views)
-tests.py                     155 checks: matching, scoring, privacy, full-game HTTP run
+public/                      the web client (landing / player / host / board views)
+tests.py                     200 checks: matching, scoring, privacy, rooms, reaper,
+                             rate limits, seat takeover, full-game HTTP run
 Start Trading Game.command   macOS double-click launcher
 start-trading-game.bat       Windows double-click launcher
-Dockerfile                   optional, for container hosting (see EXTENDING.md)
+Dockerfile                   optional, for container hosting (see MULTIROOM.md)
+state/                       per-room snapshots (created at runtime, gitignored)
 ```
