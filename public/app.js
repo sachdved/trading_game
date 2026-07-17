@@ -472,13 +472,13 @@ function buildPlayer(S) {
           <div class="quotegrid">
             <div class="buycol">
               <div class="field"><label>Bid (you buy at)</label>
-                <input type="number" id="q-bid" inputmode="decimal" step="0.5" min="0.01" max="999.99" required></div>
+                <input type="number" id="q-bid" inputmode="decimal" step="any" min="0.01" max="999.99" required></div>
               <div class="field"><label>Bid size</label>
                 <input type="number" id="q-bidsize" inputmode="numeric" step="1" min="1" max="99" required></div>
             </div>
             <div class="sellcol">
               <div class="field"><label>Ask (you sell at)</label>
-                <input type="number" id="q-ask" inputmode="decimal" step="0.5" min="0.02" max="999.99" required></div>
+                <input type="number" id="q-ask" inputmode="decimal" step="any" min="0.02" max="999.99" required></div>
               <div class="field"><label>Ask size</label>
                 <input type="number" id="q-asksize" inputmode="numeric" step="1" min="1" max="99" required></div>
             </div>
@@ -567,7 +567,7 @@ function cardValueFields(s) {
   return `<label>Card points (hearts &amp; spades; number cards stay face value)</label>
     <div class="formrow" style="grid-template-columns:repeat(4,1fr)">
       ${['A', 'K', 'Q', 'J'].map(r => `<div class="field"><label>${r}</label>
-        <input type="number" id="set-cv-${r}" value="${v[r]}" min="-200" max="200" step="5"></div>`).join('')}
+        <input type="number" id="set-cv-${r}" value="${v[r]}" min="-200" max="200" step="1"></div>`).join('')}
     </div>`;
 }
 
@@ -577,13 +577,13 @@ function liveTweaksForm(S) {
     <h3>Live rule tweaks</h3>
     <div class="formrow">
       <div class="field"><label>Quote timer (s, 0 = manual)</label>
-        <input type="number" id="set-qs" value="${s.quoteSeconds}" min="0" max="600" step="5"></div>
+        <input type="number" id="set-qs" value="${s.quoteSeconds}" min="0" max="600" step="1"></div>
       <div class="field"><label>Market timer (s, 0 = manual)</label>
-        <input type="number" id="set-ms" value="${s.marketSeconds}" min="0" max="600" step="5"></div>
+        <input type="number" id="set-ms" value="${s.marketSeconds}" min="0" max="600" step="1"></div>
     </div>
     <div class="formrow">
       <div class="field"><label>Fee per unit</label>
-        <input type="number" id="set-fee" min="0" max="10" step="0.5" value="${s.feePerUnit ?? 0}"></div>
+        <input type="number" id="set-fee" min="0" max="10" step="any" value="${s.feePerUnit ?? 0}"></div>
       <div class="field"><label>Anonymous trading</label>
         <select id="set-anon"><option value="off">Off</option>
           <option value="on" ${s.anonymous ? 'selected' : ''}>On</option></select></div>
@@ -648,16 +648,16 @@ function buildHost(S) {
           </select></div>
         <div class="formrow">
           <div class="field"><label>Quote timer (s, 0 = manual)</label>
-            <input type="number" id="set-qs" value="${s.quoteSeconds}" min="0" max="600" step="5"></div>
+            <input type="number" id="set-qs" value="${s.quoteSeconds}" min="0" max="600" step="1"></div>
           <div class="field"><label>Market timer (s, 0 = manual)</label>
-            <input type="number" id="set-ms" value="${s.marketSeconds}" min="0" max="600" step="5"></div>
+            <input type="number" id="set-ms" value="${s.marketSeconds}" min="0" max="600" step="1"></div>
         </div>
         <div class="formrow">
-          <div class="field"><label>Players dealt a card (blank = all)</label>
+          <div class="field"><label>Informed players — dealt a card (blank = all)</label>
             <input type="number" id="set-informed" min="0" max="49" step="1"
                    value="${s.informedCount ?? ''}" placeholder="everyone"></div>
           <div class="field"><label>Exchange fee per unit</label>
-            <input type="number" id="set-fee" min="0" max="10" step="0.5" value="${s.feePerUnit ?? 0}"></div>
+            <input type="number" id="set-fee" min="0" max="10" step="any" value="${s.feePerUnit ?? 0}"></div>
         </div>
         <div class="field"><label>Anonymous trading</label>
           <select id="set-anon">
