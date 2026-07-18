@@ -9,7 +9,7 @@ Python 3.9+ standard library only — run with:  python3 server.py
 Options via env:
   PORT (default 3000, 0 = random)     JOIN_URL   (public base URL for links)
   STATE_DIR (default ./state)         TRUST_PROXY=1 (honor X-Forwarded-For)
-  MAX_ROOMS / MAX_CLIENTS / MAX_CLIENTS_PER_ROOM
+  MAX_ROOMS / MAX_CLIENTS / MAX_CLIENTS_PER_ROOM / MAX_CLIENTS_PER_IP
   RATE_CREATES_PER_MIN / RATE_JOINS_PER_MIN
   ROOM_TTL_MINUTES / SETTLED_TTL_MINUTES
 Flags: --fresh  (discard all saved room snapshots and start clean)
@@ -57,6 +57,7 @@ def _env_int(name, default):
 MAX_ROOMS = _env_int('MAX_ROOMS', 40)
 MAX_CLIENTS = _env_int('MAX_CLIENTS', 400)              # SSE streams, all rooms
 MAX_CLIENTS_PER_ROOM = _env_int('MAX_CLIENTS_PER_ROOM', 120)
+MAX_CLIENTS_PER_IP = _env_int('MAX_CLIENTS_PER_IP', 60)  # generous: one house = one IP
 ROOM_TTL_MS = _env_int('ROOM_TTL_MINUTES', 120) * 60_000
 SETTLED_TTL_MS = _env_int('SETTLED_TTL_MINUTES', 30) * 60_000
 REAP_EVERY_S = 60
@@ -85,13 +86,14 @@ def now_ms():
 # ---------------------------------------------------------------- rooms
 
 class Client:
-    __slots__ = ('q', 'kind', 'pid', 'token')
+    __slots__ = ('q', 'kind', 'pid', 'token', 'ip')
 
-    def __init__(self, kind, pid=None, token=None):
+    def __init__(self, kind, pid=None, token=None, ip=None):
         self.q = queue.Queue(maxsize=100)
         self.kind = kind
         self.pid = pid
         self.token = token
+        self.ip = ip
 
 
 class Room:
@@ -147,6 +149,14 @@ def create_room():
 
 def total_clients():
     return sum(len(r.clients) for r in ROOMS.values())
+
+
+def clients_from_ip(ip):
+    """Streams already held by one client IP. Loopback (the operator's browser, or a
+    whole party funneled through a cloudflared/ngrok tunnel) is never capped."""
+    if ip in ('127.0.0.1', '::1', '::ffff:127.0.0.1'):
+        return 0
+    return sum(1 for r in ROOMS.values() for c in r.clients if c.ip == ip)
 
 
 def room_ttl_ms(room):
@@ -502,12 +512,14 @@ class Handler(BaseHTTPRequestHandler):
     def serve_events(self, code, qs):
         params = {k: v[0] for k, v in qs.items()}
         role = params.get('role', 'player')
+        ip = self.client_ip()
         with LOCK:
             room = ROOMS.get(code)
             if room is not None and role == 'host' and params.get('key') != room.host_key:
                 return self.reply(403, {'error': 'Bad host key'})
             if room is not None and (total_clients() >= MAX_CLIENTS
-                                     or len(room.clients) >= MAX_CLIENTS_PER_ROOM):
+                                     or len(room.clients) >= MAX_CLIENTS_PER_ROOM
+                                     or clients_from_ip(ip) >= MAX_CLIENTS_PER_IP):
                 return self.reply(503, {'error': 'The server is full right now.'})
 
         self.send_response(200)
@@ -534,7 +546,7 @@ class Handler(BaseHTTPRequestHandler):
         if kind == 'player' and not pid:
             return hang_up('bad-token')   # stale token: tell the client to re-join
 
-        client = Client(kind, pid, token)
+        client = Client(kind, pid, token, ip)
         with LOCK:
             if not room.alive():
                 return hang_up('no-room')
@@ -720,7 +732,9 @@ class Handler(BaseHTTPRequestHandler):
             elif action == 'endDay':
                 E.end_day(game, now)
             elif action == 'next':
-                E.next_day(game, now)
+                E.next_day(game, now, RNG)
+            elif action == 'event':
+                E.draw_event(game, now, RNG)
             elif action == 'settle':
                 E.settle(game, now)
             elif action == 'extend':

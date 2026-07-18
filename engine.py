@@ -13,8 +13,13 @@ information" deck):
     quote that crosses a resting order trades immediately at the RESTING
     order's price (price-time priority). Quotes can be pulled at any time.
     Liquidity takers send market orders that walk the book. No self-trading.
-  * At the end of a day the book is wiped overnight (positions and cash
-    carry over); after the last day the game settles.
+  * At the end of a day: outstanding forced orders execute against what is
+    left of the book, the book is wiped overnight, and margin interest is
+    charged on negative cash (host-set rate, default 0). Positions and cash
+    carry over; after the last day the game settles.
+  * Event cards (optional): drawn automatically when a later day opens and
+    on demand by the host — public value/rule shocks, dividends and levies,
+    and private forced orders (noise-trader flow).
   * Settlement: V = sum of points of ALL dealt cards; score = cash + pos * V.
   * Card points (hearts/spades): A=-40, K=+20, Q=J=0, others face value;
     diamonds/clubs = 0. Bids and asks must be strictly positive.
@@ -22,7 +27,7 @@ information" deck):
 
 import secrets
 
-GAME_VERSION = 2          # bump when the game dict shape changes (snapshots)
+GAME_VERSION = 3          # bump when the game dict shape changes (snapshots)
 
 RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
 SUITS = ['h', 's', 'd', 'c']
@@ -78,8 +83,11 @@ def create_game():
             'dealPool': 'hs',         # private cards from: hs | full deck
             'days': 1,                # trading days in the session
             'daySeconds': 300,        # length of each day; 0 = host closes days manually
+            'maxPlayers': None,       # host cap on seats; None = deck limit
             'informedCount': None,    # players dealt a private card; None = everyone
             'feePerUnit': 0,          # exchange fee charged to BOTH sides, per unit
+            'marginRate': 0,          # % per day charged on negative cash at day close
+            'eventCards': False,      # auto-draw an event card at each later day open
             'anonymous': False,       # pseudonyms on book/tape/standings until settlement
             'cardValues': dict(DEFAULT_CARD_VALUES),   # host-manipulable A/K/Q/J points
         },
@@ -89,7 +97,10 @@ def create_game():
         'book': {'bids': [], 'asks': []},   # resting orders {pid, price, size, seq}
         'seq': 0,                     # arrival counter for price-time priority
         'trades': [],                 # {i, buyer, seller, price, size, ts}
+        'events': [],                 # drawn event cards {i, day, ts, id, headline, detail}
+        'eventDeck': [],              # remaining event ids; refilled+shuffled when empty
         'feesCollected': 0,           # exchange take when feePerUnit > 0 (burned)
+        'interestPaid': 0,            # margin interest collected at day closes (burned)
         'log': [],
         'deadline': None,             # epoch ms or None
         'settlement': None,
@@ -116,8 +127,11 @@ def pool_size(game):
 
 def capacity(game):
     """Max players that can join. When only k players get cards, the deck no longer
-    limits the head count — cap on what one server instance handles comfortably."""
-    return pool_size(game) if game['settings'].get('informedCount') is None else 49
+    limits the head count — cap on what one server instance handles comfortably.
+    The host can lower it further with the maxPlayers setting."""
+    base = pool_size(game) if game['settings'].get('informedCount') is None else 49
+    cap = game['settings'].get('maxPlayers')
+    return min(base, cap) if cap else base
 
 
 def can_quote(p):
@@ -165,9 +179,12 @@ def add_player(game, raw_name, now):
     if find_active_by_name(game, name):
         raise GameError('That name is already taken.', code='taken')
     if len(active_players(game)) >= capacity(game):
+        cap = game['settings'].get('maxPlayers')
+        if cap and len(active_players(game)) >= cap:
+            raise GameError(f'The game is full — the host capped it at {cap} players.')
         raise GameError('The game is full for the current deck setting.')
     p = {'id': new_id(), 'name': name, 'role': _default_role(game),
-         'card': None, 'cash': 0, 'pos': 0, 'active': True}
+         'card': None, 'cash': 0, 'pos': 0, 'active': True, 'forced': None}
     game['players'][p['id']] = p
     game['joinOrder'].append(p['id'])
     note(game, f'{name} joined', now)
@@ -211,6 +228,24 @@ def set_settings(game, patch, now):
                 raise GameError('The day clock must be 0 (host closes the day) '
                                 'or 30-7200 seconds.')
             s['daySeconds'] = int(v)
+        if 'maxPlayers' in patch:
+            if game['phase'] != 'lobby':
+                raise GameError('The player cap can only be changed in the lobby.')
+            v = patch['maxPlayers']
+            if v in (None, ''):
+                s['maxPlayers'] = None
+            else:
+                n = _num(v, 'player cap')
+                if n != int(n) or not (2 <= n <= 49):
+                    raise GameError('Max players must be a whole number from 2 to 49.')
+                s['maxPlayers'] = int(n)
+        if 'marginRate' in patch:  # live-tunable: charged at each day close
+            v = round2(_num(patch['marginRate'], 'rate'))
+            if not (0 <= v <= 20):
+                raise GameError('The margin rate must be between 0 and 20 percent per day.')
+            s['marginRate'] = v
+        if 'eventCards' in patch:  # live-tunable: governs auto-draws at day opens
+            s['eventCards'] = bool(patch['eventCards'])
         if 'feePerUnit' in patch:  # live-tunable: applies to trades from now on
             v = round2(_num(patch['feePerUnit'], 'fee'))
             if not (0 <= v <= 10):
@@ -339,8 +374,13 @@ def start_game(game, now, rng):
     game['book'] = {'bids': [], 'asks': []}
     game['seq'] = 0
     game['trades'] = []
+    game['events'] = []
+    game['eventDeck'] = []
     game['feesCollected'] = 0
+    game['interestPaid'] = 0
     game['settlement'] = None
+    for p in players:
+        p['forced'] = None
     ds = game['settings']['daySeconds']
     game['deadline'] = now + ds * 1000 if ds > 0 else None
     days = game['settings']['days']
@@ -350,22 +390,56 @@ def start_game(game, now, rng):
                + (f'; day 1 of {days}' if days > 1 else ''), now)
 
 
+def _execute_forced(game, now):
+    """Fill outstanding forced orders against what's left of the book, then clear."""
+    for p in active_players(game):
+        f = p.get('forced')
+        if f and f['size'] > 0:
+            limit = MAX_PRICE if f['side'] == 'buy' else 0
+            _match_incoming(game, p['id'], f['side'], limit, f['size'], now)
+    for p in game['players'].values():
+        p['forced'] = None
+
+
+def _charge_margin(game, now):
+    """Overnight interest on margin loans: negative cash pays rate% at day close."""
+    rate = game['settings'].get('marginRate') or 0
+    if not rate:
+        return
+    total = 0
+    for p in active_players(game):
+        if p['cash'] < 0:
+            interest = round2(-p['cash'] * rate / 100)
+            p['cash'] = round2(p['cash'] - interest)
+            total = round2(total + interest)
+    if total:
+        game['interestPaid'] = round2(game.get('interestPaid', 0) + total)
+        note(game, f'Overnight margin interest charged: {total}', now)
+
+
+def _close_day(game, now):
+    """End-of-day mechanics: forced orders execute, the book is wiped, margin accrues."""
+    _execute_forced(game, now)
+    game['book'] = {'bids': [], 'asks': []}
+    _charge_margin(game, now)
+
+
 def end_day(game, now):
-    """Close the current day: wipe the book overnight; settle after the last day."""
+    """Close the current day overnight; settling instead after the last day."""
     if game['phase'] != 'open':
         raise GameError('No day is open right now.')
+    _close_day(game, now)
     if game['day'] >= game['settings']['days']:
-        settle(game, now)
+        _settle(game, now)
         return 'settled'
-    game['book'] = {'bids': [], 'asks': []}
     game['phase'] = 'between'
     game['deadline'] = None
     note(game, f"Day {game['day']} closed — the book is wiped overnight, positions carry", now)
     return 'between'
 
 
-def next_day(game, now):
-    """Open the next trading day with a fresh, empty book."""
+def next_day(game, now, rng):
+    """Open the next trading day with a fresh, empty book (and maybe an event)."""
     if game['phase'] != 'between':
         raise GameError('The market is not between days.')
     game['day'] += 1
@@ -373,6 +447,117 @@ def next_day(game, now):
     ds = game['settings']['daySeconds']
     game['deadline'] = now + ds * 1000 if ds > 0 else None
     note(game, f"Day {game['day']} of {game['settings']['days']} — market open", now)
+    if game['settings'].get('eventCards'):
+        draw_event(game, now, rng)
+
+
+# ---------------------------------------------------------------- event cards
+
+EVENT_CARDS = [
+    {'id': 'ace-crash',   'headline': 'Rating downgrade — Aces fall 30 points'},
+    {'id': 'king-rally',  'headline': 'Merger rumor — Kings gain 30 points'},
+    {'id': 'royal-swap',  'headline': 'Shock reversal — Ace and King values swap'},
+    {'id': 'face-lift',   'headline': 'Meme rally — Queens and Jacks gain 15'},
+    {'id': 'fee-hike',    'headline': 'Regulator steps in — the trading fee rises 0.5/unit'},
+    {'id': 'fee-holiday', 'headline': 'Fee holiday — exchange fees drop to zero'},
+    {'id': 'dark-pool',   'headline': 'Dark pool opens — trading turns anonymous'},
+    {'id': 'flash-close', 'headline': 'Flash session — the day closes in 60 seconds'},
+    {'id': 'forced-buy',  'headline': 'Mandate — one trader must BUY before the close'},
+    {'id': 'forced-sell', 'headline': 'Redemption — one trader must SELL before the close'},
+    {'id': 'dividend',    'headline': 'Dividend — +3 cash per unit held (shorts pay)'},
+    {'id': 'levy',        'headline': 'Special levy — −3 cash per unit held (shorts collect)'},
+    {'id': 'short-audit', 'headline': 'Short audit — shorts pay 2/unit to the exchange'},
+]
+
+
+def _eligible_forced(game):
+    return [p for p in active_players(game) if can_take(p) and not p.get('forced')]
+
+
+def _apply_event(game, eid, now, rng):
+    """Mutate the game per event card; returns the public detail line."""
+    s = game['settings']
+    vals = dict(s.get('cardValues') or DEFAULT_CARD_VALUES)
+    clamp = lambda v: max(-200, min(200, int(v)))
+    if eid == 'ace-crash':
+        vals['A'] = clamp(vals['A'] - 30)
+        s['cardValues'] = vals
+        return f"Aces are now worth {vals['A']} points."
+    if eid == 'king-rally':
+        vals['K'] = clamp(vals['K'] + 30)
+        s['cardValues'] = vals
+        return f"Kings are now worth {vals['K']} points."
+    if eid == 'royal-swap':
+        vals['A'], vals['K'] = vals['K'], vals['A']
+        s['cardValues'] = vals
+        return f"Aces are now {vals['A']}, Kings {vals['K']}."
+    if eid == 'face-lift':
+        vals['Q'] = clamp(vals['Q'] + 15)
+        vals['J'] = clamp(vals['J'] + 15)
+        s['cardValues'] = vals
+        return f"Queens are now {vals['Q']}, Jacks {vals['J']}."
+    if eid == 'fee-hike':
+        s['feePerUnit'] = round2(min(10, (s.get('feePerUnit') or 0) + 0.5))
+        return f"The fee is now {s['feePerUnit']}/unit, charged to both sides."
+    if eid == 'fee-holiday':
+        s['feePerUnit'] = 0
+        return 'Trading is free until further notice.'
+    if eid == 'dark-pool':
+        s['anonymous'] = True
+        return 'Book, tape and standings show pseudonyms from now on.'
+    if eid == 'flash-close':
+        target = now + 60_000
+        if game['deadline'] is None or game['deadline'] > target:
+            game['deadline'] = target
+        return 'Close your positions — the day ends in 60 seconds.'
+    if eid in ('forced-buy', 'forced-sell'):
+        side = 'buy' if eid == 'forced-buy' else 'sell'
+        p = rng.choice(_eligible_forced(game))
+        p['forced'] = {'side': side, 'size': rng.randint(1, 3)}
+        return 'Who received the order — and its size — is private.'
+    if eid == 'dividend':
+        for p in game['players'].values():
+            p['cash'] = round2(p['cash'] + 3 * p['pos'])
+        return 'Every position received 3 per unit; shorts paid it.'
+    if eid == 'levy':
+        for p in game['players'].values():
+            p['cash'] = round2(p['cash'] - 3 * p['pos'])
+        return 'Every position paid 3 per unit; shorts collected it.'
+    if eid == 'short-audit':
+        take = 0
+        for p in game['players'].values():
+            if p['pos'] < 0:
+                fine = round2(2 * -p['pos'])
+                p['cash'] = round2(p['cash'] - fine)
+                take = round2(take + fine)
+        game['feesCollected'] = round2(game.get('feesCollected', 0) + take)
+        return (f'Shorts paid {take} to the exchange.' if take
+                else 'No shorts were found — nothing collected.')
+    return ''
+
+
+def draw_event(game, now, rng):
+    """Draw the next applicable event card and apply it."""
+    if game['phase'] != 'open':
+        raise GameError('Event cards can only be drawn while the market is open.')
+    eid = None
+    for _ in range(len(EVENT_CARDS) + 1):
+        if not game['eventDeck']:
+            game['eventDeck'] = [e['id'] for e in EVENT_CARDS]
+            rng.shuffle(game['eventDeck'])
+        cand = game['eventDeck'].pop()
+        if cand in ('forced-buy', 'forced-sell') and not _eligible_forced(game):
+            continue   # nobody can receive an order right now; skip this card
+        eid = cand
+        break
+    if eid is None:
+        raise GameError('No applicable event card right now.')
+    detail = _apply_event(game, eid, now, rng)
+    card = next(e for e in EVENT_CARDS if e['id'] == eid)
+    game['events'].append({'i': len(game['events']), 'day': game['day'], 'ts': now,
+                           'id': eid, 'headline': card['headline'], 'detail': detail})
+    note(game, f"Event card: {card['headline']}", now)
+    return {'headline': card['headline'], 'detail': detail}
 
 
 # ---------------------------------------------------------------- the book
@@ -500,13 +685,25 @@ def market_order(game, pid, side, size, now):
     if not fills:
         raise GameError('No asks available to buy from right now.' if side == 'buy'
                         else 'No bids available to sell to right now.')
+    f = p.get('forced')
+    if f and f['side'] == side:   # voluntary fills count toward a forced order
+        f['size'] -= sz - rem
+        if f['size'] <= 0:
+            p['forced'] = None
     return {'requested': sz, 'filled': sz - rem, 'fills': fills}
 
 
 def settle(game, now):
-    """Close the market: cancel the book, reveal cards, and score everyone."""
+    """Close the market now: run day-close mechanics if mid-day, then score."""
     if game['phase'] not in ('open', 'between'):
         raise GameError('The market has not opened — nothing to settle.')
+    if game['phase'] == 'open':
+        _close_day(game, now)
+    _settle(game, now)
+
+
+def _settle(game, now):
+    """Reveal cards and score everyone (books are already closed)."""
     game['book'] = {'bids': [], 'asks': []}
     vals = game['settings'].get('cardValues')
     participants = [game['players'][pid] for pid in game['joinOrder']]
@@ -531,6 +728,7 @@ def settle(game, now):
     game['settlement'] = {'V': v, 'publicCards': game['publicCards'], 'rows': rows,
                           'groups': groups,
                           'feesCollected': game.get('feesCollected', 0),
+                          'interestPaid': game.get('interestPaid', 0),
                           'anonymous': bool(game['settings'].get('anonymous'))}
     game['phase'] = 'settled'
     game['deadline'] = None
@@ -545,9 +743,10 @@ def rematch(game, now):
     game['joinOrder'] = [pid for pid in game['joinOrder'] if game['players'][pid]['active']]
     game['players'] = {pid: game['players'][pid] for pid in game['joinOrder']}
     for p in game['players'].values():
-        p.update(card=None, cash=0, pos=0, informed=None, alias=None)
+        p.update(card=None, cash=0, pos=0, informed=None, alias=None, forced=None)
     game.update(phase='lobby', day=0, publicCards=[], book={'bids': [], 'asks': []},
-                seq=0, trades=[], feesCollected=0, settlement=None, deadline=None)
+                seq=0, trades=[], events=[], eventDeck=[], feesCollected=0,
+                interestPaid=0, settlement=None, deadline=None)
     note(game, 'Rematch — back to the lobby with the same players', now)
 
 
@@ -623,6 +822,9 @@ def view_for(game, kind, pid=None, extras=None):
                   'buyer': disp(t['buyer']), 'seller': disp(t['seller']),
                   'price': t['price'], 'size': t['size']}
                  for t in game['trades'][-30:]],
+        'events': [{'i': e['i'], 'day': e['day'], 'headline': e['headline'],
+                    'detail': e['detail']}
+                   for e in game['events'][-6:]],
         'standings': standings,
         'settlement': game['settlement'],
     }
@@ -636,7 +838,7 @@ def view_for(game, kind, pid=None, extras=None):
         base['me'] = {
             'id': p['id'], 'name': p['name'], 'role': p['role'], 'card': p['card'],
             'informed': p.get('informed'),
-            'cash': p['cash'], 'pos': p['pos'],
+            'cash': p['cash'], 'pos': p['pos'], 'forced': p.get('forced'),
             'canQuote': can_quote(p), 'canTake': can_take(p),
             'fills': [{'i': t['i'],
                        'side': 'bought' if t['buyer'] == pid else 'sold',

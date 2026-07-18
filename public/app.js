@@ -92,6 +92,7 @@ let viewKey = '';        // what the current DOM layout was built for
 let skew = 0;            // serverNow - clientNow
 let lastFillSeen = null; // toast only fills newer than this
 let prevPhase = null, prevTapeMax = -1;
+let prevEventMax = null, prevForced = null;
 let hostKey = ROOM ? (localStorage.getItem(lsKey('hostKey')) || '') : '';
 let soundOn = false, audioCtx = null;
 
@@ -175,11 +176,21 @@ function update() {
   if ($('log') && S.log) set('log', S.log.slice().reverse().map(l => `<li>${esc(l.msg)}</li>`).join(''));
   if ($('joinurl') && S.joinUrl) set('joinurl', esc(S.joinUrl));
   if ($('setsline')) set('setsline', settingsLine(S));
+  if ($('eventline')) {
+    const ev = (S.events || [])[(S.events || []).length - 1];
+    set('eventline', ev
+      ? `🃏 <b>${esc(ev.headline)}</b> <span class="small muted">(day ${ev.day}) ${esc(ev.detail || '')}</span>`
+      : '');
+  }
 
   if (S.me) {
     set('mypos', `pos <b>${signed(S.me.pos)}</b>`);
     set('mycash', `cash <b class="${numCls(S.me.cash)}">${signed(S.me.cash)}</b>`);
     if ($('submitnote')) set('submitnote', restingNoteHTML(S));
+    if ($('forcedbanner')) set('forcedbanner', S.me.forced
+      ? `📣 <b>ORDER:</b> ${S.me.forced.side === 'buy' ? 'BUY' : 'SELL'} <b>${S.me.forced.size}</b> before ` +
+        `the close — any unfilled remainder executes automatically`
+      : '');
     if ($('myfills')) set('myfills', myFillsHTML(S));
     if ($('bestinfo')) set('bestinfo', bestInfoHTML(S));
     if ($('buybtn')) {
@@ -212,6 +223,26 @@ function watchEvents() {
       if (navigator.vibrate) navigator.vibrate(60);
       lastFillSeen = maxI;
     }
+  }
+  const evs = S.events || [];
+  const evMax = evs.length ? evs[evs.length - 1].i : -1;
+  if (S.phase === 'lobby') prevEventMax = null;
+  else if (prevEventMax === null) prevEventMax = evMax;
+  else if (evMax > prevEventMax) {
+    evs.filter(ev => ev.i > prevEventMax).forEach(ev =>
+      toast(`🃏 <b>${esc(ev.headline)}</b><br><span class="small">${esc(ev.detail || '')}</span>`));
+    if (KIND === 'board') { blip(523); setTimeout(() => blip(392), 140); }
+    prevEventMax = evMax;
+  }
+  if (S.me) {
+    const f = S.me.forced ? `${S.me.forced.side}:${S.me.forced.size}` : '';
+    if (prevForced === null) prevForced = f;
+    else if (f && f !== prevForced) {
+      toast(`📣 <b>Trading order received</b> — you must ${S.me.forced.side === 'buy' ? 'BUY' : 'SELL'} ` +
+            `<b>${S.me.forced.size}</b> before the close`, 'err');
+      if (navigator.vibrate) navigator.vibrate(200);
+      prevForced = f;
+    } else if (f !== prevForced) prevForced = f;
   }
   if (KIND === 'board') {
     const maxT = S.tape.length ? S.tape[S.tape.length - 1].i : -1;
@@ -268,6 +299,9 @@ function settingsLine(S) {
   if (['A', 'K', 'Q', 'J'].some(r => vals[r] !== DEFAULT_CARD_VALUES[r]))
     parts.push(`Points: A=${vals.A}, K=${vals.K}, Q=${vals.Q}, J=${vals.J}`);
   if (+s.feePerUnit > 0) parts.push(`Fee: ${fmt(s.feePerUnit)}/unit`);
+  if (+s.marginRate > 0) parts.push(`Margin: ${fmt(s.marginRate)}%/day`);
+  if (s.eventCards) parts.push('Event cards on');
+  if (s.maxPlayers) parts.push(`Max ${s.maxPlayers} players`);
   if (s.anonymous) parts.push('Anonymous trading');
   return parts.join(' · ');
 }
@@ -406,7 +440,11 @@ function settlementHTML(S, { podium = false } = {}) {
      no-card players (${st.groups.uninformed.n}) averaged <b class="${numCls(st.groups.uninformed.avgTotal)}">${signed(st.groups.uninformed.avgTotal)}</b>.
      That gap is what information is worth here.`);
   if (st.feesCollected) extras.push(
-    `The exchange collected <b>${fmt(st.feesCollected)}</b> in fees, so player totals sum to −${fmt(st.feesCollected)}.`);
+    `The exchange collected <b>${fmt(st.feesCollected)}</b> in trading fees.`);
+  if (st.interestPaid) extras.push(
+    `The margin desk collected <b>${fmt(st.interestPaid)}</b> in overnight interest.`);
+  const take = (st.feesCollected || 0) + (st.interestPaid || 0);
+  if (take) extras.push(`Player totals therefore sum to −${fmt(take)}.`);
   return `${podiumHTML}
     <div class="vmath"><b>V</b> = public (${pub}) + private (${priv}) = <b class="${numCls(st.V)}">${st.V}</b></div>
     ${extras.length ? `<div class="vmath" style="margin-top:8px">${extras.join('<br>')}</div>` : ''}
@@ -559,7 +597,10 @@ function buildPlayer(S) {
         <p class="small muted">Fills instantly at the best resting price(s), first come first served.
         Big orders walk the book.</p>
       </div>` : '';
-    main = `${quoteForm}${takePanel}
+    main = `
+      <div id="forcedbanner" style="margin:2px 0 8px;font-weight:800;color:#e5484d"></div>
+      <div id="eventline" style="margin:2px 0 8px"></div>
+      ${quoteForm}${takePanel}
       <div class="panel"><h3>Order book</h3>${bookHTML()}</div>
       ${meCardPanel(S, true)}
       <div class="panel"><h3>Your fills</h3><ul class="tape" id="myfills"></ul></div>
@@ -569,7 +610,8 @@ function buildPlayer(S) {
     main = `
       <div class="panel"><h2>Day ${S.day} closed</h2>
         <p class="waiting">Overnight — the book is wiped, positions and cash carry.
-        Waiting for the host to open day ${S.day + 1}…</p></div>
+        Waiting for the host to open day ${S.day + 1}…</p>
+        <div id="eventline"></div></div>
       ${meCardPanel(S, true)}
       <div class="panel"><h3>Standings</h3><div id="standings"></div></div>
       <div class="panel"><h3>Your fills</h3><ul class="tape" id="myfills"></ul></div>
@@ -637,6 +679,13 @@ function liveTweaksForm(S) {
         <select id="set-anon"><option value="off">Off</option>
           <option value="on" ${s.anonymous ? 'selected' : ''}>On</option></select></div>
     </div>
+    <div class="formrow">
+      <div class="field"><label>Margin rate (%/day)</label>
+        <input type="number" id="set-margin" min="0" max="20" step="any" value="${s.marginRate ?? 0}"></div>
+      <div class="field"><label>Event cards (auto-draw)</label>
+        <select id="set-events"><option value="off">Off</option>
+          <option value="on" ${s.eventCards ? 'selected' : ''}>On</option></select></div>
+    </div>
     ${cardValueFields(s)}
     <button class="btn" type="submit">Apply from now on</button>
     <p class="small muted">The day clock applies from the next day open; fees to the next trade;
@@ -652,6 +701,7 @@ function hostActions(S) {
   }
   if (S.phase === 'open') {
     b.push(`<button class="btn" data-action="host-cmd" data-cmd="extend">+30s</button>`);
+    b.push(`<button class="btn" data-action="host-cmd" data-cmd="event">🃏 Draw event</button>`);
     b.push(S.day < days
       ? `<button class="btn primary" data-action="host-cmd" data-cmd="endDay">🌙 Close day ${S.day} now</button>`
       : `<button class="btn primary" data-action="host-cmd" data-cmd="endDay" data-confirm="Close the market and settle? All private cards will be revealed.">🏁 Close &amp; settle</button>`);
@@ -711,11 +761,25 @@ function buildHost(S) {
           <div class="field"><label>Exchange fee per unit</label>
             <input type="number" id="set-fee" min="0" max="10" step="any" value="${s.feePerUnit ?? 0}"></div>
         </div>
-        <div class="field"><label>Anonymous trading</label>
-          <select id="set-anon">
-            <option value="off">Off — real names on the book &amp; tape</option>
-            <option value="on" ${s.anonymous ? 'selected' : ''}>On — pseudonyms until settlement</option>
-          </select></div>
+        <div class="formrow">
+          <div class="field"><label>Max players (blank = deck limit)</label>
+            <input type="number" id="set-maxp" min="2" max="49" step="1"
+                   value="${s.maxPlayers ?? ''}" placeholder="deck limit"></div>
+          <div class="field"><label>Margin rate (%/day on borrowed cash)</label>
+            <input type="number" id="set-margin" min="0" max="20" step="any" value="${s.marginRate ?? 0}"></div>
+        </div>
+        <div class="formrow">
+          <div class="field"><label>Event cards</label>
+            <select id="set-events">
+              <option value="off">Off</option>
+              <option value="on" ${s.eventCards ? 'selected' : ''}>On — auto-draw at each day open</option>
+            </select></div>
+          <div class="field"><label>Anonymous trading</label>
+            <select id="set-anon">
+              <option value="off">Off — real names</option>
+              <option value="on" ${s.anonymous ? 'selected' : ''}>On — pseudonyms until settlement</option>
+            </select></div>
+        </div>
         ${cardValueFields(s)}
         <button class="btn" type="submit">Save settings</button>
         <p class="small muted">The card count is public but <i>who</i> got one stays secret —
@@ -725,6 +789,7 @@ function buildHost(S) {
   } else if (S.phase === 'open') {
     left = `
       <div class="panel"><h2>${S.settings.days > 1 ? `Day ${S.day} of ${S.settings.days} — market open` : 'Market open'}</h2>
+        <div id="eventline" style="margin:4px 0 8px"></div>
         <div class="spreadline" id="spreadline" style="text-align:left;font-size:1.05rem;font-weight:700"></div>
         ${bookHTML()}<hr class="divider">${hostActions(S)}</div>
       <div class="panel"><h3>Players</h3><div id="roster"></div></div>`;
@@ -770,6 +835,7 @@ function buildBoard(S) {
   } else if (S.phase === 'open') {
     const { k, n } = dealtCount(S);
     main = `
+      <div id="eventline" style="text-align:center;font-size:1.15em;margin:4px 0"></div>
       <div class="spreadline" id="spreadline"></div>
       <div class="cols">
         <div><div class="panel"><h3>Order book</h3>${bookHTML()}</div>
@@ -786,6 +852,7 @@ function buildBoard(S) {
       <div class="bigcenter" style="padding:24px 0 8px">
         <h1 style="font-size:2em">Day ${S.day} closed</h1>
         <p class="muted">Overnight — the book is wiped, positions carry into day ${S.day + 1}.</p>
+        <div id="eventline" style="font-size:1.15em"></div>
       </div>
       <div class="cols">
         <div><div class="panel"><h3>Standings</h3><div id="standings"></div></div></div>
@@ -841,7 +908,10 @@ document.addEventListener('submit', async e => {
       if ($('set-days')) st.days = +$('set-days').value;
       if ($('set-ds')) st.daySeconds = +$('set-ds').value;
       if ($('set-informed')) st.informedCount = $('set-informed').value === '' ? null : +$('set-informed').value;
+      if ($('set-maxp')) st.maxPlayers = $('set-maxp').value === '' ? null : +$('set-maxp').value;
       if ($('set-fee')) st.feePerUnit = +$('set-fee').value;
+      if ($('set-margin')) st.marginRate = +$('set-margin').value;
+      if ($('set-events')) st.eventCards = $('set-events').value === 'on';
       if ($('set-anon')) st.anonymous = $('set-anon').value === 'on';
       if ($('set-cv-A')) st.cardValues = Object.fromEntries(
         ['A', 'K', 'Q', 'J'].map(r => [r, +$('set-cv-' + r).value]));
@@ -940,6 +1010,12 @@ function showRules() {
         best resting price(s), first come first served; big orders walk the book.</li>
       <li><b>Trading days:</b> the session can run over several "days". Overnight the book is
         wiped (positions and cash carry over); after the last day the market settles.</li>
+      <li><b>Event cards (host option):</b> news can land when a day opens or whenever the host
+        draws a card — value shocks, fee changes, dividends and levies… and sometimes a
+        <b>private order</b> forcing one trader to buy or sell before the close. Nobody else
+        knows who got it; the unfilled part executes automatically at the close.</li>
+      <li><b>Margin (host option):</b> negative cash is a margin loan — it is charged the set
+        interest rate at every day close.</li>
       <li><b>Scoring:</b> cash from your fills <b>+ net position × V</b>. Shorts are fine;
         so are negative scores. Trade on what you know — and on what others' trades tell you.</li>
     </ul>`;

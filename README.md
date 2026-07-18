@@ -83,8 +83,12 @@ the days (automatic when the day clock is on). `+30s` and close-now buttons over
 - **Market orders** fill against the best resting price(s), first come first served; an
   order bigger than the best level walks down the book at each level's own price; you
   never trade with yourself.
-- **Overnight:** when a day ends, all resting orders are canceled; positions and cash
-  carry into the next day, which opens with an empty book.
+- **Overnight:** when a day ends, outstanding forced orders execute against what's left
+  of the book, all resting orders are canceled, and margin interest (if set) is charged
+  on negative cash. Positions and cash carry into the next day's empty book.
+- **Event cards (optional):** public news drawn at day opens or by the host — value and
+  fee shocks, dividends and levies, flash closes — plus private forced orders that
+  inject noise-trader flow nobody can attribute.
 - **Settlement:** V = sum of the points of **all** dealt cards (public + every private
   card actually in play). Score = cash from filled orders + net position × V. Shorting
   and negative scores are allowed; the game is zero-sum, minus any exchange fees the
@@ -108,15 +112,18 @@ takers take — use "everyone" mode (good for small groups) to let all players d
 | Private-card deck | hearts & spades | "full deck" for more cards in play |
 | Trading days | 1 | run several continuous sessions back-to-back — the book is wiped overnight, positions carry. Can be raised mid-game ("overtime") |
 | Day clock | 300s | length of each trading day; 0 = the host closes days manually; changeable mid-game (applies from the next day) |
+| Max players | deck limit | host cap on seats in this room (2–49); the deck still caps it when lower. Server-wide caps (rooms, connections) are env vars — see EXTENDING.md |
+| Margin rate | 0 %/day | negative cash is a margin loan: charged this rate at every day close; the take is reported at settlement like fees |
+| Event cards | off | one card auto-draws each time a later day opens, plus a host **Draw event** button: value shocks, fee changes, dividends/levies, forced anonymity, flash closes — and private **forced orders** (one trader must buy/sell before the close; unfilled parts execute automatically) |
 | Players dealt a card | everyone | set *k* to create **informed vs. uninformed** traders: k random players get a card, the rest get nothing (worth 0). The count is public; *who* is secret — even from the host. Settlement compares the groups' average scores. |
 | Exchange fee per unit | 0 | charged to **both** sides of every fill and kept by the exchange; flip it on between rounds and watch spreads widen |
 | Anonymous trading | off | book, tape and standings show stable pseudonyms (Trader 1, 2, …) until settlement; the host still sees real names |
 | Card points (A/K/Q/J) | −40 / +20 / 0 / 0 | host-editable, even mid-game as a "news shock"; number cards stay face value |
 
-Fee, anonymity, the day count/clock and card points are also editable **mid-game** from
-the host panel ("Live rule tweaks"). Roles, deck, and the informed count are fixed once
-cards are dealt. Active non-default rules always show in the settings line that
-players and the board see.
+Fee, anonymity, margin rate, event cards, the day count/clock and card points are also
+editable **mid-game** from the host panel ("Live rule tweaks"). Roles, deck, player cap,
+and the informed count are fixed once cards are dealt. Active non-default rules always
+show in the settings line that players and the board see.
 
 ## Practical notes
 
@@ -151,7 +158,7 @@ Everything above the rules section is written for someone who has never seen a
 terminal; the launchers cover Mac and Windows. MIT licensed (see `LICENSE`), so copy,
 tweak, and re-share freely. If you put it on GitHub, the included workflow
 (`.github/workflows/tests.yml`) runs the test suite on Linux/macOS/Windows and on
-Python 3.9 through 3.13 on every push.
+Python 3.9 and 3.13 on every push.
 
 ## Tests
 
@@ -176,7 +183,7 @@ server.py                    multi-room HTTP + Server-Sent-Events server, timers
                              room registry, rate limits, per-room persistence
 engine.py                    game rules: dealing, matching, market orders, scoring
 public/                      the web client (landing / player / host / board views)
-tests.py                     222 checks: matching, scoring, privacy, rooms, reaper,
+tests.py                     257 checks: matching, scoring, privacy, rooms, reaper,
                              rate limits, seat takeover, full-game HTTP run
 Start_Trading_Game.command   macOS double-click launcher
 start-trading-game.bat       Windows double-click launcher

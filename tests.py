@@ -246,9 +246,9 @@ def test_day_flow_and_settle():
                  'not open')
     expect_error(lambda: E.market_order(g, bob, 'buy', 1, NOW), 'not open')
 
-    E.next_day(g, NOW)
+    E.next_day(g, NOW, random.Random(1))
     ok(g['phase'] == 'open' and g['day'] == 2, 'day 2 opens with a fresh book')
-    expect_error(lambda: E.next_day(g, NOW), 'between')
+    expect_error(lambda: E.next_day(g, NOW, random.Random(1)), 'between')
 
     # deterministic scoring: override the dealt cards
     g['publicCards'] = [{'rank': 'K', 'suit': 's'}, {'rank': '5', 'suit': 'h'}, {'rank': 'Q', 'suit': 'h'}]
@@ -298,7 +298,7 @@ def test_kick_and_deadline():
     ok(E.on_deadline(g2, NOW + 59_000, random.Random(1)) is None, 'not yet')
     ok(E.on_deadline(g2, NOW + 60_001, random.Random(1)) == 'endDay', 'clock closes day 1')
     ok(g2['phase'] == 'between' and g2['deadline'] is None, 'overnight has no clock')
-    E.next_day(g2, NOW + 70_000)
+    E.next_day(g2, NOW + 70_000, random.Random(1))
     ok(g2['deadline'] == NOW + 130_000, 'day 2 clock armed')
     ok(E.on_deadline(g2, NOW + 130_001, random.Random(1)) == 'settle', 'last day clock settles')
     ok(g2['phase'] == 'settled', 'game settled by the clock')
@@ -441,11 +441,124 @@ def test_card_values():
     ok(E.card_points({'rank': 'A', 'suit': 'h'}) == -40, 'module defaults are unchanged')
 
 
+def test_player_cap():
+    g = E.create_game()
+    E.set_settings(g, {'maxPlayers': 3, 'roles': 'everyone'}, NOW)
+    for i in range(3):
+        E.add_player(g, f'P{i}', NOW)
+    expect_error(lambda: E.add_player(g, 'P3', NOW), 'full')
+    expect_error(lambda: E.set_settings(g, {'maxPlayers': 2}, NOW), 'too many')
+    E.set_settings(g, {'maxPlayers': None}, NOW)
+    ok(E.capacity(g) == 23, 'blank cap falls back to the deck limit')
+    expect_error(lambda: E.set_settings(g, {'maxPlayers': 1}, NOW), '2 to 49')
+    expect_error(lambda: E.set_settings(g, {'maxPlayers': 2.5}, NOW), 'whole number')
+
+
+def test_margin_interest():
+    g, ps = make_game(['Ana', 'Bob'], days=2)
+    E.set_settings(g, {'marginRate': 10}, NOW)
+    ana, bob = ps['Ana']['id'], ps['Bob']['id']
+    E.submit_quote(g, ana, {'bid': 9, 'bidSize': 3, 'ask': 10, 'askSize': 3}, NOW)
+    E.market_order(g, bob, 'buy', 3, NOW)          # Bob: cash -30
+    E.end_day(g, NOW)
+    ok(ps['Bob']['cash'] == -33.0, 'overnight interest charged on negative cash')
+    ok(ps['Ana']['cash'] == 30, 'positive cash earns nothing')
+    ok(g['interestPaid'] == 3.0, 'interest accrues to the exchange take')
+    E.settle(g, NOW)                                # from overnight: no second charge
+    ok(ps['Bob']['cash'] == -33.0 and g['interestPaid'] == 3.0,
+       'settling from overnight does not double-charge')
+    st = g['settlement']
+    ok(st['interestPaid'] == 3.0, 'settlement reports the interest take')
+    ok(abs(sum(r['total'] for r in st['rows']) + 3.0) < 1e-9,
+       'totals sum to minus the interest collected')
+
+    # settling straight out of an open day charges that day exactly once
+    g2, ps2 = make_game(['C', 'D'])
+    E.set_settings(g2, {'marginRate': 20}, NOW)
+    E.submit_quote(g2, ps2['C']['id'], {'bid': 5, 'bidSize': 2, 'ask': 6, 'askSize': 2}, NOW)
+    E.market_order(g2, ps2['D']['id'], 'buy', 2, NOW)   # D: cash -12
+    E.settle(g2, NOW)
+    ok(ps2['D']['cash'] == -14.4 and g2['interestPaid'] == 2.4,
+       'early settle from an open day charges the margin once')
+    expect_error(lambda: E.set_settings(g2, {'marginRate': 25}, NOW), '0 and 20')
+
+
+def test_event_cards():
+    g, ps = make_game(['Ana', 'Bob'])
+    ana, bob = ps['Ana']['id'], ps['Bob']['id']
+    rng = random.Random(1)
+    expect_error(lambda: E.draw_event(E.create_game(), NOW, rng), 'open')
+
+    # rig the deck for deterministic draws
+    g['eventDeck'] = ['ace-crash']
+    r = E.draw_event(g, NOW, rng)
+    ok(g['settings']['cardValues']['A'] == -70, 'value shock moved the ace')
+    ok(g['events'][-1]['id'] == 'ace-crash' and 'Aces' in r['headline'], 'event logged')
+
+    g['eventDeck'] = ['fee-hike']
+    E.draw_event(g, NOW, rng)
+    ok(g['settings']['feePerUnit'] == 0.5, 'fee shock raised the fee')
+    g['eventDeck'] = ['fee-holiday']
+    E.draw_event(g, NOW, rng)
+    ok(g['settings']['feePerUnit'] == 0, 'fee holiday zeroed the fee')
+
+    g['eventDeck'] = ['flash-close']
+    E.draw_event(g, NOW, rng)
+    ok(g['deadline'] == NOW + 60_000, 'flash close set a 60s deadline')
+    g['deadline'] = None
+
+    # dividends and levies move cash with positions, zero-sum
+    E.submit_quote(g, ana, {'bid': 9, 'bidSize': 2, 'ask': 10, 'askSize': 2}, NOW)
+    E.market_order(g, bob, 'buy', 2, NOW)   # Bob +2 @ -20 cash; Ana -2 @ +20 cash
+    g['eventDeck'] = ['dividend']
+    E.draw_event(g, NOW, rng)
+    ok(ps['Bob']['cash'] == -14 and ps['Ana']['cash'] == 14, 'dividend pays +3/unit; shorts pay')
+    g['eventDeck'] = ['short-audit']
+    E.draw_event(g, NOW, rng)
+    ok(ps['Ana']['cash'] == 10 and g['feesCollected'] == 4, 'short audit: shorts pay 2/unit')
+
+    # forced orders: private, voluntary fills count, remainder executes at the close
+    g['eventDeck'] = ['forced-buy']
+    E.draw_event(g, NOW, rng)
+    target = next(p for p in g['players'].values() if p.get('forced'))
+    other = next(p for p in g['players'].values() if not p.get('forced'))
+    ok(target['forced']['side'] == 'buy' and 1 <= target['forced']['size'] <= 3,
+       'forced order issued')
+    ex = {'now': NOW, 'connections': {}}
+    ok('forced' not in json.dumps(E.view_for(g, 'board', None, ex))
+       and 'forced' not in json.dumps(E.view_for(g, 'host', None, ex)),
+       'board/host views never mention the order')
+    ok(E.view_for(g, 'player', other['id'], ex)['me']['forced'] is None,
+       'other players see no order')
+    ok(E.view_for(g, 'player', target['id'], ex)['me']['forced'] == target['forced'],
+       'the target sees their own order')
+
+    size = target['forced']['size']
+    E.submit_quote(g, other['id'], {'bid': 1, 'bidSize': 1, 'ask': 8, 'askSize': 5}, NOW)
+    E.market_order(g, target['id'], 'buy', 1, NOW)
+    ok((target['forced'] is None) if size == 1 else target['forced']['size'] == size - 1,
+       'voluntary buys count toward the forced order')
+    trades_before = len(g['trades'])
+    E.end_day(g, NOW)   # days=1: the close also settles
+    ok(all(p['forced'] is None for p in g['players'].values()), 'orders cleared at the close')
+    if size > 1:
+        ok(len(g['trades']) > trades_before, 'the unfilled remainder executed at the close')
+    ok(g['phase'] == 'settled', 'day closed and settled')
+
+    # eventCards on: opening a later day auto-draws
+    g3, _ = make_game(['P', 'Q'], days=2)
+    E.set_settings(g3, {'eventCards': True}, NOW)
+    E.end_day(g3, NOW)
+    E.next_day(g3, NOW, random.Random(3))
+    ok(len(g3['events']) == 1 and g3['events'][0]['day'] == 2, 'day open auto-drew an event')
+
+
 UNIT_TESTS = [test_cards, test_lobby_and_roles, test_settings_days, test_deal,
               test_deal_full_pool, test_quote_validation, test_continuous_matching,
               test_market_orders, test_day_flow_and_settle,
               test_kick_and_deadline, test_view_privacy,
-              test_informed_axis, test_fee_and_anonymous, test_card_values]
+              test_informed_axis, test_fee_and_anonymous, test_card_values,
+              test_player_cap, test_margin_interest, test_event_cards]
 
 
 # ================================================================ multi-room units
@@ -582,10 +695,10 @@ def spawn_server(state_dir, fresh=True, extra_env=None):
     return proc, port
 
 
-def sse_open(port, path):
+def sse_open(port, path, headers=''):
     """Open an SSE stream raw and keep the socket alive."""
     s = socket.create_connection(('127.0.0.1', port), timeout=6)
-    s.sendall(f'GET {path} HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n\r\n'.encode())
+    s.sendall(f'GET {path} HTTP/1.1\r\nHost: x\r\nAccept: text/event-stream\r\n{headers}\r\n'.encode())
     s.settimeout(6)
     return s
 
@@ -773,6 +886,10 @@ def test_integration():
         code, _ = host(A, KA, 'next')
         code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['phase'] == 'open' and st['day'] == 2, 'day 2 open')
+        code, _ = host(A, KA, 'event')
+        ok(code == 200, 'host drew an event card')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
+        ok(st['events'] and st['events'][-1]['headline'], 'the event shows up in state')
         code, _ = host(A, KA, 'endDay')
         code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['phase'] == 'settled', 'closing the last day settled the game')
@@ -883,6 +1000,35 @@ def test_caps_http():
         buf2 = sse_snoop(port, f'/r/{A}/events?role=board', b'full')
         s1.close()
         ok(b'503' in buf2 and b'full' in buf2, 'per-room SSE cap returns 503')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    # per-IP SSE cap: one hostile IP cannot eat the server-wide connection budget
+    proc, port = spawn_server(tempfile.mkdtemp(),
+                              extra_env={'MAX_CLIENTS_PER_IP': '1', 'TRUST_PROXY': '1'})
+    BASE = f'http://127.0.0.1:{port}'
+    try:
+        code, r1 = req('POST', '/api/rooms', {})
+        A = r1['code']
+        s1 = sse_open(port, f'/r/{A}/events?role=board',
+                      headers='X-Forwarded-For: 5.5.5.5\r\n')
+        buf = sse_read_until(s1, b'data: ')
+        ok(b'data: ' in buf, 'first stream from an IP connects')
+        s2 = sse_open(port, f'/r/{A}/events?role=board',
+                      headers='X-Forwarded-For: 5.5.5.5\r\n')
+        buf2 = sse_read_until(s2, b'full')
+        s2.close()
+        ok(b'503' in buf2 and b'full' in buf2, 'second stream from the same IP is capped')
+        s3 = sse_open(port, f'/r/{A}/events?role=board',
+                      headers='X-Forwarded-For: 6.6.6.6\r\n')
+        buf3 = sse_read_until(s3, b'data: ')
+        s3.close()
+        s1.close()
+        ok(b'data: ' in buf3, 'a different IP still connects')
     finally:
         proc.terminate()
         try:

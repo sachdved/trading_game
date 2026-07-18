@@ -52,6 +52,7 @@ The architecture dictates the deployment shape, so read this first:
 | `TRUST_PROXY` | off | set `1` behind a reverse proxy so rate limits key on the **rightmost** `X-Forwarded-For` hop (the one your proxy appended — spoof-proof) instead of the proxy's IP |
 | `MAX_ROOMS` | 40 | concurrent rooms; creation returns 503 beyond this |
 | `MAX_CLIENTS` / `MAX_CLIENTS_PER_ROOM` | 400 / 120 | SSE connection caps (server-wide / per room) |
+| `MAX_CLIENTS_PER_IP` | 60 | SSE cap per client IP — one hostile IP can't drain the budget; generous because a whole party can share one NAT address (loopback exempt) |
 | `RATE_CREATES_PER_MIN` / `RATE_JOINS_PER_MIN` | 5 / 30 | per-IP rate limits (0 disables); direct loopback traffic (the operator's browser, or a whole classroom behind a cloudflared/ngrok tunnel) is exempt |
 | `ROOM_TTL_MINUTES` / `SETTLED_TTL_MINUTES` | 120 / 30 | idle lifetimes for live rooms / finished-or-empty rooms |
 | `--fresh` (flag) | — | discard all saved room snapshots on boot |
@@ -222,6 +223,9 @@ those plus the rules that are still one-line code edits:
 | Anonymity (hide who quoted/traded) | **built in** — host setting `anonymous`; pseudonyms assigned in `start_game()`, applied in `view_for()` | |
 | Trading days / day clock | **built in** — settings `days` / `daySeconds` (0 = manual), live-tunable | `engine.end_day()` / `next_day()` for what happens overnight |
 | Quote pulling (cancels) | **built in** — `engine.cancel_quotes()` + `/api/cancel` | forbid it to make quotes firm again |
+| Seats per room | **built in** — lobby setting `maxPlayers` (server-wide caps are env vars) | `engine.capacity()` |
+| Margin interest on borrowed cash | **built in** — setting `marginRate` (%/day), charged in `engine._charge_margin()` at day close | pay interest on positive cash too, or charge shorts |
+| Event cards | **built in** — setting `eventCards` (auto-draw at day opens) + host `event` action | add/edit cards in `engine.EVENT_CARDS` + `_apply_event()`; forced-order flow in `_execute_forced()` |
 | Who gets information | **built in** — host setting `informedCount` (see section 3) | |
 | What counts as a cross (`bid ≥ ask` vs. strict `>`) | `engine._match_incoming()` | the price-comparison `break` line |
 | Trade price (resting price vs. midpoint) | `engine._match_incoming()` | the `o['price']` passed to `_apply_trade` |
