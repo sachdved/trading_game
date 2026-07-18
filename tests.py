@@ -19,6 +19,10 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import engine as E
 
+# Windows pipes (CI, redirects) default to cp1252, which can't print ✓/✗.
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+
 PASSED = 0
 
 
@@ -678,7 +682,7 @@ def spawn_server(state_dir, fresh=True, extra_env=None):
     args = [sys.executable, 'server.py'] + (['--fresh'] if fresh else [])
     proc = subprocess.Popen(args, cwd=os.path.dirname(os.path.abspath(__file__)),
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True)
+                            encoding='utf-8', errors='replace')
     port = None
     deadline = time.time() + 10
     while time.time() < deadline:

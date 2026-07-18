@@ -776,6 +776,9 @@ def lan_ip():
 
 def main():
     global BASE_URL
+    # Windows pipes (CI, redirects) default to cp1252, which can't print the ♠♥ banner.
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     load_rooms()
 
     want = os.environ.get('PORT')
