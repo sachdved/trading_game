@@ -11,7 +11,8 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Starting the trading game - your browser will open the host panel."
+echo "Starting the trading game - your browser will open the game page."
+echo "Click 'Create a room' there to become the host."
 echo "Keep this window open while you play. Press Ctrl+C to stop."
 echo
 

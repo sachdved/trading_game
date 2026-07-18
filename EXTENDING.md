@@ -3,7 +3,7 @@
 This is the operator/developer companion to [README.md](README.md). It covers three
 things: putting the game on the web, changing the exchange's rules, and the design for
 **informed vs. uninformed traders** (a separate axis from market maker vs. liquidity
-taker — specced below, not yet implemented).
+taker — built in as the `informedCount` host setting; see section 3).
 
 ---
 
@@ -22,39 +22,47 @@ Everything below is only for putting a copy on the actual internet.
 
 The architecture dictates the deployment shape, so read this first:
 
-- **One process, one instance.** All game state lives in the memory of a single
-  `server.py` process (with a JSON snapshot on disk). Never run 2+ replicas or workers
-  behind a load balancer — players would land on different games.
+- **One process, one instance — many rooms.** The server hosts any number of
+  independent rooms (each a 5-letter code, its own game and host key), but all of them
+  live in the memory of a single `server.py` process (with per-room JSON snapshots on
+  disk). Never run 2+ replicas or workers behind a load balancer — players would land
+  on different copies of their room.
 - **Always-on.** Clients hold open Server-Sent-Events connections and phase timers run
-  server-side. "Scale-to-zero" / free tiers that sleep on idle will pause the game
+  server-side. "Scale-to-zero" / free tiers that sleep on idle will pause games
   mid-round. Use an always-on tier.
 - **Plain HTTP/1.1, no WebSockets.** Any reverse proxy works if it doesn't buffer
   streaming responses (see proxy notes). The app heartbeats every 15s, so ordinary
   60s idle timeouts are fine.
 - **HTTPS strongly preferred** for anything off your LAN (phones trust it, and the
   screen wake-lock feature only works in secure contexts).
-- **Capacity:** one thread per connected client; comfortable to ~50 players / ~100
-  connections. It is a classroom game, not a hardened public service — host it for the
-  duration of an event, behind an unguessable URL, and tear it down or reset after.
+- **Capacity:** one thread per connected client; comfortable to a few hundred
+  concurrent connections across all rooms (the default caps below stop it well before
+  it hurts). It is a party/classroom game, not a hardened public service.
+- **Housekeeping is built in:** rooms with nobody connected expire (~2 h idle, ~30 min
+  once settled or never used), snapshots are deleted with them, and room creation /
+  joining is rate-limited per IP.
 
 ### Environment contract
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `PORT` | 3000 (tries 3000–3010; `0` = random) | listen port |
-| `HOST_KEY` | random per fresh game | set it explicitly in production so your host link survives restarts and redeploys |
-| `JOIN_URL` | `http://<lan-ip>:<port>` | the URL shown to players on the board/banner — set to your public URL |
-| `STATE_FILE` | `./state.json` | snapshot path; put it on a persistent volume if you want games to survive restarts |
-| `--fresh` (flag) | — | ignore any existing snapshot on boot |
-| `--open` (flag) | — | open the host panel in the default browser after startup (what the double-click launchers pass) |
+| `JOIN_URL` | `http://<lan-ip>:<port>` | public base URL used in every join/host link — set it to your domain in production |
+| `STATE_DIR` | `./state` | per-room snapshots (`<CODE>.json`); put it on a persistent volume if you want rooms to survive restarts |
+| `TRUST_PROXY` | off | set `1` behind a reverse proxy so rate limits key on the **rightmost** `X-Forwarded-For` hop (the one your proxy appended — spoof-proof) instead of the proxy's IP |
+| `MAX_ROOMS` | 40 | concurrent rooms; creation returns 503 beyond this |
+| `MAX_CLIENTS` / `MAX_CLIENTS_PER_ROOM` | 400 / 120 | SSE connection caps (server-wide / per room) |
+| `MAX_CLIENTS_PER_IP` | 60 | SSE cap per client IP — one hostile IP can't drain the budget; generous because a whole party can share one NAT address (loopback exempt) |
+| `RATE_CREATES_PER_MIN` / `RATE_JOINS_PER_MIN` | 5 / 30 | per-IP rate limits (0 disables); direct loopback traffic (the operator's browser, or a whole classroom behind a cloudflared/ngrok tunnel) is exempt |
+| `ROOM_TTL_MINUTES` / `SETTLED_TTL_MINUTES` | 120 / 30 | idle lifetimes for live rooms / finished-or-empty rooms |
+| `--fresh` (flag) | — | discard all saved room snapshots on boot |
+| `--open` (flag) | — | open the landing page in the default browser after startup (what the double-click launchers pass) |
 
-**Host auth:** a browser on the server machine itself is host **without a key** — the
-check requires both a loopback peer *and* a `localhost` Host header, which is what the
-double-click launchers rely on. Tunnels (cloudflared/ngrok) also connect from loopback
-but forward the public hostname in the Host header, so tunneled traffic still needs
-`?key=…`. Corollary for shared machines: anyone who can browse `localhost:3000` on the
-server box is the host — on a multi-user box, front it with a proxy and only expose
-the proxy.
+**Host auth is per room.** Creating a room returns its host key; the creator's browser
+stores it and is let straight into `/r/CODE/host`. From any other device, use the
+room's *Copy host link* button (the link carries `?key=…`). There is **no**
+localhost/operator bypass: the machine the server runs on has no special powers over
+rooms, which is exactly what you want on a shared public box.
 
 ### Option A — tunnel from your laptop (best for a one-off session)
 
@@ -70,7 +78,8 @@ JOIN_URL=https://<random>.trycloudflare.com python3 server.py
 
 Pros: free, instant, HTTPS included, works for Zoom-remote players. Cons: your laptop
 must stay awake and on the network; the URL changes every run. (ngrok or
-`tailscale serve` work the same way.)
+`tailscale serve` work the same way.) Rooms created before the `JOIN_URL` restart show
+stale links — create rooms after it.
 
 ### Option B — container platform (Fly.io / Railway / Render / anything)
 
@@ -101,7 +110,8 @@ app = "gm-trading-game"
 
 [env]
   PORT = "3000"
-  STATE_FILE = "/data/state.json"
+  STATE_DIR = "/data/state"
+  TRUST_PROXY = "1"
   JOIN_URL = "https://gm-trading-game.fly.dev"
 
 [mounts]
@@ -112,12 +122,11 @@ app = "gm-trading-game"
 ```bash
 fly launch --no-deploy          # then paste the toml above
 fly volumes create gmdata --size 1
-fly secrets set HOST_KEY=<something-long>
 fly deploy && fly scale count 1 # exactly one machine
 ```
 
 Platform gotchas: **Render's free tier sleeps on idle** (breaks the game — use a paid
-always-on instance and attach a persistent disk for `STATE_FILE`); Railway is fine on
+always-on instance and attach a persistent disk for `STATE_DIR`); Railway is fine on
 any always-on plan (set the env vars in the dashboard, keep 1 replica).
 
 ### Option C — small VPS or an internal VM (systemd + Caddy)
@@ -134,9 +143,9 @@ After=network.target
 WorkingDirectory=/opt/trading-game
 ExecStart=/usr/bin/python3 /opt/trading-game/server.py
 Environment=PORT=3000
-Environment=HOST_KEY=change-me-to-something-long
 Environment=JOIN_URL=https://game.example.com
-Environment=STATE_FILE=/var/lib/trading-game/state.json
+Environment=STATE_DIR=/var/lib/trading-game
+Environment=TRUST_PROXY=1
 DynamicUser=yes
 StateDirectory=trading-game
 Restart=on-failure
@@ -170,12 +179,15 @@ location / {
 ### Go-live checklist
 
 - [ ] Exactly **one** instance/replica, on an **always-on** tier
-- [ ] `HOST_KEY` set explicitly (and kept secret — it is the only admin auth)
-- [ ] `JOIN_URL` set to the public URL (it's what the projector shows)
-- [ ] `STATE_FILE` on a persistent volume *if* you want restart-resume (optional)
+- [ ] `JOIN_URL` set to the public URL (it's what every join/host link is built from)
+- [ ] `TRUST_PROXY=1` if a reverse proxy or platform edge sits in front
+- [ ] `STATE_DIR` on a persistent volume *if* you want rooms to survive restarts (optional)
 - [ ] HTTPS in front (platform or Caddy)
-- [ ] After each event: host panel **Reset game**, or redeploy with `--fresh`
-- [ ] Remember anyone with the URL can join as a player — share it at game time
+- [ ] Point an uptime monitor at `/healthz` (reports room/client counts)
+- [ ] Deploys drop in-memory rooms not yet snapshotted — prefer deploying when
+      `/healthz` shows few rooms
+- [ ] Remember anyone with the URL can create rooms and join them — that's the point,
+      but the per-IP rate limits and `MAX_ROOMS` are your abuse valves
 
 ---
 
@@ -188,8 +200,10 @@ The separation of concerns is strict, which is what makes rule-hacking safe:
 - **`engine.py`** — every game rule, as small functions over one JSON-able `game` dict.
   No I/O, no clocks (`now` and `rng` are always passed in). *This is the only file you
   touch to change how the market works.*
-- **`server.py`** — transport only: HTTP, SSE fan-out, the phase timer, snapshots,
-  auth. It calls engine functions under a lock and never interprets rules.
+- **`server.py`** — transport only: HTTP, SSE fan-out, the room registry, phase
+  timers, snapshots, auth, rate limits. It calls engine functions under a lock and
+  never interprets rules. Every room is an independent game dict, so rule changes in
+  `engine.py` apply to all rooms alike.
 - **`public/app.js`** — rendering only; it draws whatever state the server pushes.
   You touch it only when a new rule needs a knob or a display.
 - **`tests.py`** — run `python3 tests.py` after *every* rule change; the matching,
@@ -199,24 +213,27 @@ The separation of concerns is strict, which is what makes rule-hacking safe:
 
 Several of these are **already host settings** — no code needed (see the README
 settings table): per-unit **fee**, **anonymous trading**, **card point values**
-(A/K/Q/J), **timers**, and the **informed count**. The map below covers those plus the
-rules that are still one-line code edits:
+(A/K/Q/J), the **day count/clock**, and the **informed count**. The map below covers
+those plus the rules that are still one-line code edits:
 
 | Rule you want to manipulate | Where | What to edit |
 |---|---|---|
 | Card point values (A=−40, K=+20, …) | **built in** — host setting `cardValues` | `engine.card_points()` if you want to touch number cards / off-suits too |
 | Per-trade transaction cost *c* (the deck's Props. on costs) | **built in** — host setting `feePerUnit`, applied in `engine._apply_trade()` | split maker/taker instead of symmetric, rebate models, … |
-| Anonymity (hide who quoted/traded) | **built in** — host setting `anonymous`; pseudonyms assigned in `start_game()`, applied in `view_for()` | e.g. anonymize the quote checklist too |
-| Round timers / manual advancement | **built in** — settings `quoteSeconds` / `marketSeconds` (0 = manual), live-tunable | `engine.ALL_IN_GRACE_MS` for the 5s all-quotes-in grace |
+| Anonymity (hide who quoted/traded) | **built in** — host setting `anonymous`; pseudonyms assigned in `start_game()`, applied in `view_for()` | |
+| Trading days / day clock | **built in** — settings `days` / `daySeconds` (0 = manual), live-tunable | `engine.end_day()` / `next_day()` for what happens overnight |
+| Quote pulling (cancels) | **built in** — `engine.cancel_quotes()` + `/api/cancel` | forbid it to make quotes firm again |
+| Seats per room | **built in** — lobby setting `maxPlayers` (server-wide caps are env vars) | `engine.capacity()` |
+| Margin interest on borrowed cash | **built in** — setting `marginRate` (%/day), charged in `engine._charge_margin()` at day close | pay interest on positive cash too, or charge shorts |
+| Event cards | **built in** — setting `eventCards` (auto-draw at day opens) + host `event` action | add/edit cards in `engine.EVENT_CARDS` + `_apply_event()`; forced-order flow in `_execute_forced()` |
 | Who gets information | **built in** — host setting `informedCount` (see section 3) | |
-| What counts as a cross (`bid ≥ ask` vs. strict `>`) | `engine.reveal()` | the `if b['price'] < a['price']: break` comparison |
-| Trade price (at the ask vs. midpoint) | `engine.reveal()` | the `price=a['price']` passed to `_apply_trade` |
-| Priority / tie-breaking | `engine.reveal()` | the two `sort(key=…)` lines (`price`, then `-size`, then random) |
+| What counts as a cross (`bid ≥ ask` vs. strict `>`) | `engine._match_incoming()` | the price-comparison `break` line |
+| Trade price (resting price vs. midpoint) | `engine._match_incoming()` | the `o['price']` passed to `_apply_trade` |
+| Priority / tie-breaking | `engine._rest()` | the two `sort(key=…)` lambdas (price, then arrival `seq`) |
 | Tick size / price & size limits | `engine.MAX_PRICE`, `MAX_SIZE`, `round2`, `_num`, `_size` | validation & rounding |
-| Self-cross / self-trade prohibitions | `engine.submit_quote()` (ask>own bid), `engine.market_order()` (skips own orders) | the checks |
-| Two-sided quote requirement / one-sided quotes | `engine.submit_quote()` validation + how `reveal()` builds `bids`/`asks` | allow size 0 on one side |
-| Quotes firm vs. cancelable in the market phase | add a `cancel_quote()` engine function + a host/player action in `server.py`/`app.js` | new feature |
-| Book carried across rounds vs. wiped | `engine.end_market()` (clears), `next_round()` | keep the book instead of clearing |
+| Self-cross / self-trade prohibitions | `engine.submit_quote()` (ask>own bid), `engine._match_incoming()` (skips own orders) | the checks |
+| Two-sided quote requirement / one-sided quotes | `engine.submit_quote()` validation | allow size 0 on one side |
+| Book carried across days vs. wiped overnight | `engine.end_day()` | keep the book instead of clearing |
 | Number of public cards, deal pools | `engine.start_game()` | the dealing block |
 | Scoring formula | `engine.settle()` | `total = cash + pos*V` |
 
@@ -225,7 +242,8 @@ Classroom playbook with the built-in knobs: run a clean baseline game; rematch w
 deck's transaction-cost proposition); rematch with `informedCount` well below the
 player count and watch the market maker's adverse-selection problem appear for real;
 turn on **anonymity** and see how much harder inference from the tape gets; change an
-**ace's value** between rounds as a public news shock and watch the repricing.
+**ace's value** mid-game (or overnight, between days) as a public news shock and watch
+the repricing.
 
 ### Recipe: promoting a rule to a host-controllable setting
 
@@ -236,7 +254,7 @@ touch points in the code as the reference example. The same steps apply to any k
    (see `'feePerUnit': 0`).
 2. **Validate** — `engine.set_settings()`: add a clause (range-check it; decide whether
    it is *lobby-only* — anything that affects dealt cards/roles must be, like
-   `informedCount` — or *live-tunable* like the timers, fee, anonymity and card
+   `informedCount` — or *live-tunable* like the day clock, fee, anonymity and card
    values). Note the whole function validates-then-commits: on any error it restores
    the previous settings.
 3. **Apply** — wherever the rule bites (the fee lives in `engine._apply_trade()`, which
@@ -260,15 +278,16 @@ touch points in the code as the reference example. The same steps apply to any k
   resume breaks.
 - **Serializability:** the `game` dict must stay `json.dumps`-able (no sets, objects,
   tuples-as-keys) or snapshots and SSE break.
-- **Locking:** any new server endpoint mutating state must do so inside `with LOCK:`
-  and finish with `touched()`.
+- **Locking:** any new server endpoint mutating a room must do so inside `with LOCK:`
+  and finish with `touched(room)`.
 
 ### Snapshot compatibility
 
-`state.json` is a dump of the game dict. After changing the state *shape*, old
-snapshots may lack your new keys — either read them defensively
-(`settings.get('feePerUnit', 0)`) or just restart with `--fresh` after deploying a
-rules change. Mid-game rule upgrades are not worth supporting.
+Each `state/<CODE>.json` is a dump of that room's game dict. The dict carries
+`gameVersion` (`engine.GAME_VERSION`); `load_rooms` silently discards snapshots from a
+different version at boot. So after changing the state *shape*, bump `GAME_VERSION` —
+old rooms are dropped instead of resuming into rules they weren't played under.
+Mid-game rule upgrades are not worth supporting.
 
 ---
 
@@ -300,7 +319,7 @@ This produces real adverse selection: a market maker quoting against a mixed cro
 cannot tell whether the order hitting them is informed — which is precisely
 Propositions 1–5 territory. (Defaulting `informedCount` to "everyone" reproduces the
 original game exactly, and `informedCount = 0` gives a pure common-knowledge baseline
-round.)
+market.)
 
 ### Host setting & assignment (as built)
 

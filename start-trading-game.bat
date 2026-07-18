@@ -4,14 +4,16 @@ cd /d "%~dp0"
 
 where py >nul 2>nul
 if %errorlevel%==0 (
-  echo Starting the trading game - your browser will open the host panel.
+  echo Starting the trading game - your browser will open the game page.
+  echo Click "Create a room" there to become the host.
   echo Keep this window open while you play. Press Ctrl+C to stop.
   echo.
   py -3 server.py --open
 ) else (
   where python >nul 2>nul
   if %errorlevel%==0 (
-    echo Starting the trading game - your browser will open the host panel.
+    echo Starting the trading game - your browser will open the game page.
+  echo Click "Create a room" there to become the host.
     echo Keep this window open while you play. Press Ctrl+C to stop.
     echo.
     python server.py --open
