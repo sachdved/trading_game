@@ -1,8 +1,8 @@
 # The Glosten–Milgrom trading game
 
 A party-sized market game about trading with imperfect information, played from phones
-on the same wifi. One laptop **is the exchange**: it deals the cards, collects quotes,
-runs the call auction, fills market orders in time priority, tracks everyone's cash and
+on the same wifi. One laptop **is the exchange**: it deals the cards, runs a live
+price-time-priority order book with continuous trading, tracks everyone's cash and
 positions, and settles the game — nobody has to keep an order book by hand.
 
 Nothing to install beyond Python: 100% standard library (3.9+), one folder, no build.
@@ -16,7 +16,7 @@ One person hosts on a laptop; everyone else joins from their phone **on the same
    tick *"Add python.exe to PATH"*).
 2. **Get this folder** — download the repo ZIP (or have a friend send it) and unzip.
 3. **Start it:**
-   - **macOS:** double-click `Start Trading Game.command` (first time: right-click →
+   - **macOS:** double-click `Start_Trading_Game.command` (first time: right-click →
      *Open*, since it's a downloaded script)
    - **Windows:** double-click `start-trading-game.bat`
    - **any terminal:** `python3 server.py`
@@ -46,20 +46,19 @@ second room on the same laptop. The URLs:
 
 1. Create a room, open its host panel, and put the room's board view on the projector.
 2. In the lobby, pick settings (defaults are sensible) and flip anyone's role if you like.
-3. **Deal cards & start round 1.** Everyone sees the 3 public cards; each player sees
+3. **Deal cards & open the market.** Everyone sees the 3 public cards; each player sees
    their own private card on their phone.
-4. **Quote phase** (default 90s): market makers submit bid / bid size / ask / ask size.
-   It auto-reveals 5 seconds after the last quote is in, or when the timer ends.
-5. **Reveal:** the call auction matches crossing quotes automatically and posts the
-   trades to the tape. Leftover quotes become the live order book.
-6. **Market phase** (default 120s): takers hit the bid / lift the ask from their phones,
-   filled first-come-first-served. Fills pop up as notifications for both sides.
-7. When the round closes, click **Start round N+1** (typically 3–5 rounds total),
-   or **Settle & reveal cards** — the board shows the podium, V, and every score.
-8. **Rematch** keeps the same players and re-deals.
+4. **Trading is live and continuous** (default: one 5-minute day). Market makers post —
+   and re-post, and pull — two-sided quotes; takers hit the bid / lift the ask. Anything
+   that crosses trades the instant it arrives; fills pop up on both phones.
+5. If you configured multiple **days**, each day ends with the book wiped overnight
+   (positions and cash carry). Click **Open day N+1** when everyone's ready.
+6. After the last day (clock, or **Close & settle**) the board shows the podium, V, and
+   every score.
+7. **Rematch** keeps the same players and re-deals.
 
-The host never enters a single order — you only advance the phases (and even that is
-automatic if the timers are on). `+30s` and "end now" buttons override the clock.
+The host never enters a single order — the market runs itself; you just open and close
+the days (automatic when the day clock is on). `+30s` and close-now buttons override it.
 
 ## The rules, as implemented
 
@@ -74,32 +73,32 @@ automatic if the timers are on). `+30s` and "end now" buttons override the clock
 - **Card points** (hearts & spades), by default: Ace = **−40**, King = **+20**,
   Queen & Jack = 0, others = face value. Clubs & diamonds = 0. A/K/Q/J values are
   host-adjustable.
-- Each round every market maker submits a two-sided quote. Prices must be strictly
-  positive and your ask must be above your own bid (max price 999.99, sizes 1–99).
-- **Call auction at the reveal:** orders match where bid ≥ ask, settle **at the ask**,
-  volume = the smaller size. Lowest asks and highest bids fill first; ties favor larger
-  size, then random. Everything is revealed with names, like writing it on the slide.
-- **Market phase:** unfilled quotes rest in the book. Market orders fill by time
-  priority; an order bigger than the best level walks down the book at each level's own
-  price; you never trade with yourself. Quotes are firm — no cancels.
-- **Round close:** all remaining orders are canceled. Next round starts from fresh quotes.
+- Trading runs in one or more continuous **days** (host setting). Within a day, market
+  makers keep a live two-sided quote: bid / bid size / ask / ask size. Prices must be
+  strictly positive and your ask must be above your own bid (max price 999.99, sizes
+  1–99). Re-posting **replaces** your previous quote; you can also pull your quotes.
+- **Crossing on arrival:** the book is a standard price-time-priority limit-order book.
+  If an incoming bid meets a resting ask (bid ≥ ask), it trades immediately **at the
+  resting order's price** — stale quotes get picked off, exactly like real markets.
+- **Market orders** fill against the best resting price(s), first come first served; an
+  order bigger than the best level walks down the book at each level's own price; you
+  never trade with yourself.
+- **Overnight:** when a day ends, all resting orders are canceled; positions and cash
+  carry into the next day, which opens with an empty book.
 - **Settlement:** V = sum of the points of **all** dealt cards (public + every private
   card actually in play). Score = cash from filled orders + net position × V. Shorting
   and negative scores are allowed; the game is zero-sum, minus any exchange fees the
   host enabled (the settlement screen accounts for the exchange's take).
 
-### Judgment calls where the deck was ambiguous
+### Departures from the original deck
 
-The slide says orders match "where the bid exceeds the ask" and that "remaining orders
-are canceled" right after matching — taken literally, market orders would have nothing
-to trade against. The app implements the (clearly intended) playable version:
-
-1. Bids **equal** to an ask do cross (standard exchange behavior; price = the ask).
-2. Leftover quotes stay live **through the market-order window**, and are canceled when
-   the round closes.
-3. A market order larger than the best level walks the book rather than being rejected.
-4. In "assigned roles" mode, market makers quote only and takers take only; use
-   "everyone" mode (default suggestion for small groups) to let all players do both.
+The classroom deck runs sealed-bid rounds with a call auction at a reveal; this app
+implements the **continuous** version instead: quotes are live and repriceable, crossing
+orders trade instantly at the resting price, and a session can span several trading days
+with the book wiped overnight. Other conventions kept from standard exchanges: bids
+**equal** to an ask do cross (price = the resting ask), oversized orders walk the book
+rather than being rejected, and in "assigned roles" mode market makers quote while
+takers take — use "everyone" mode (good for small groups) to let all players do both.
 
 ## Settings
 
@@ -107,15 +106,15 @@ to trade against. The app implements the (clearly intended) playable version:
 |---|---|---|
 | Roles | assigned (alternating) | or "everyone quotes and takes" |
 | Private-card deck | hearts & spades | "full deck" for more cards in play |
-| Quote timer | 90s | 0 = advance manually; auto-reveals when all quotes are in; changeable mid-game |
-| Market timer | 120s | the deck's "two minutes"; 0 = manual; changeable mid-game |
+| Trading days | 1 | run several continuous sessions back-to-back — the book is wiped overnight, positions carry. Can be raised mid-game ("overtime") |
+| Day clock | 300s | length of each trading day; 0 = the host closes days manually; changeable mid-game (applies from the next day) |
 | Players dealt a card | everyone | set *k* to create **informed vs. uninformed** traders: k random players get a card, the rest get nothing (worth 0). The count is public; *who* is secret — even from the host. Settlement compares the groups' average scores. |
 | Exchange fee per unit | 0 | charged to **both** sides of every fill and kept by the exchange; flip it on between rounds and watch spreads widen |
 | Anonymous trading | off | book, tape and standings show stable pseudonyms (Trader 1, 2, …) until settlement; the host still sees real names |
 | Card points (A/K/Q/J) | −40 / +20 / 0 / 0 | host-editable, even mid-game as a "news shock"; number cards stay face value |
 
-Fee, anonymity, timers and card points are also editable **between rounds** from the
-host panel ("Live rule tweaks"). Roles, deck, and the informed count are fixed once
+Fee, anonymity, the day count/clock and card points are also editable **mid-game** from
+the host panel ("Live rule tweaks"). Roles, deck, and the informed count are fixed once
 cards are dealt. Active non-default rules always show in the settings line that
 players and the board see.
 
@@ -177,9 +176,9 @@ server.py                    multi-room HTTP + Server-Sent-Events server, timers
                              room registry, rate limits, per-room persistence
 engine.py                    game rules: dealing, matching, market orders, scoring
 public/                      the web client (landing / player / host / board views)
-tests.py                     200 checks: matching, scoring, privacy, rooms, reaper,
+tests.py                     222 checks: matching, scoring, privacy, rooms, reaper,
                              rate limits, seat takeover, full-game HTTP run
-Start Trading Game.command   macOS double-click launcher
+Start_Trading_Game.command   macOS double-click launcher
 start-trading-game.bat       Windows double-click launcher
 Dockerfile                   optional, for container hosting (see MULTIROOM.md)
 state/                       per-room snapshots (created at runtime, gitignored)

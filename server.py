@@ -274,6 +274,9 @@ def load_rooms():
                     or code != os.path.splitext(fname)[0].upper()
                     or not snap.get('game', {}).get('phase')):
                 continue
+            if snap['game'].get('gameVersion') != E.GAME_VERSION:
+                os.remove(path)   # snapshot from an older rules version
+                continue
             room = Room(code, host_key=snap.get('hostKey'))
             room.game = snap['game']
             room.tokens = snap.get('tokens', {})
@@ -589,6 +592,7 @@ class Handler(BaseHTTPRequestHandler):
                 '/api/join': self.h_join,
                 '/api/claim': self.h_claim,
                 '/api/quote': self.h_quote,
+                '/api/cancel': self.h_cancel,
                 '/api/market': self.h_market,
                 '/api/host': self.h_host,
             }.get(m.group(2) or '') if m else None
@@ -671,6 +675,14 @@ class Handler(BaseHTTPRequestHandler):
             touched(room)
         self.reply(200, {'ok': True, **result})
 
+    def h_cancel(self, code, body):
+        with LOCK:
+            room = self.get_room(code)
+            pid = self.player_from(room, body)
+            result = E.cancel_quotes(room.game, pid, now_ms())
+            touched(room)
+        self.reply(200, {'ok': True, **result})
+
     def h_market(self, code, body):
         with LOCK:
             room = self.get_room(code)
@@ -705,16 +717,14 @@ class Handler(BaseHTTPRequestHandler):
                 E.set_role(game, body.get('pid'), body.get('role'), now)
             elif action == 'start':
                 E.start_game(game, now, RNG)
-            elif action == 'reveal':
-                E.reveal(game, now, RNG)
-            elif action == 'endMarket':
-                E.end_market(game, now)
+            elif action == 'endDay':
+                E.end_day(game, now)
             elif action == 'next':
-                E.next_round(game, now)
+                E.next_day(game, now)
             elif action == 'settle':
                 E.settle(game, now)
             elif action == 'extend':
-                if game['phase'] not in ('quote', 'market'):
+                if game['phase'] != 'open':
                     raise E.GameError('Nothing to extend right now.')
                 secs = max(5, min(300, int(body.get('seconds') or 30)))
                 game['deadline'] = (game['deadline'] or now) + secs * 1000

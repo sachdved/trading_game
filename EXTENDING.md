@@ -212,24 +212,24 @@ The separation of concerns is strict, which is what makes rule-hacking safe:
 
 Several of these are **already host settings** — no code needed (see the README
 settings table): per-unit **fee**, **anonymous trading**, **card point values**
-(A/K/Q/J), **timers**, and the **informed count**. The map below covers those plus the
-rules that are still one-line code edits:
+(A/K/Q/J), the **day count/clock**, and the **informed count**. The map below covers
+those plus the rules that are still one-line code edits:
 
 | Rule you want to manipulate | Where | What to edit |
 |---|---|---|
 | Card point values (A=−40, K=+20, …) | **built in** — host setting `cardValues` | `engine.card_points()` if you want to touch number cards / off-suits too |
 | Per-trade transaction cost *c* (the deck's Props. on costs) | **built in** — host setting `feePerUnit`, applied in `engine._apply_trade()` | split maker/taker instead of symmetric, rebate models, … |
-| Anonymity (hide who quoted/traded) | **built in** — host setting `anonymous`; pseudonyms assigned in `start_game()`, applied in `view_for()` | e.g. anonymize the quote checklist too |
-| Round timers / manual advancement | **built in** — settings `quoteSeconds` / `marketSeconds` (0 = manual), live-tunable | `engine.ALL_IN_GRACE_MS` for the 5s all-quotes-in grace |
+| Anonymity (hide who quoted/traded) | **built in** — host setting `anonymous`; pseudonyms assigned in `start_game()`, applied in `view_for()` | |
+| Trading days / day clock | **built in** — settings `days` / `daySeconds` (0 = manual), live-tunable | `engine.end_day()` / `next_day()` for what happens overnight |
+| Quote pulling (cancels) | **built in** — `engine.cancel_quotes()` + `/api/cancel` | forbid it to make quotes firm again |
 | Who gets information | **built in** — host setting `informedCount` (see section 3) | |
-| What counts as a cross (`bid ≥ ask` vs. strict `>`) | `engine.reveal()` | the `if b['price'] < a['price']: break` comparison |
-| Trade price (at the ask vs. midpoint) | `engine.reveal()` | the `price=a['price']` passed to `_apply_trade` |
-| Priority / tie-breaking | `engine.reveal()` | the two `sort(key=…)` lines (`price`, then `-size`, then random) |
+| What counts as a cross (`bid ≥ ask` vs. strict `>`) | `engine._match_incoming()` | the price-comparison `break` line |
+| Trade price (resting price vs. midpoint) | `engine._match_incoming()` | the `o['price']` passed to `_apply_trade` |
+| Priority / tie-breaking | `engine._rest()` | the two `sort(key=…)` lambdas (price, then arrival `seq`) |
 | Tick size / price & size limits | `engine.MAX_PRICE`, `MAX_SIZE`, `round2`, `_num`, `_size` | validation & rounding |
-| Self-cross / self-trade prohibitions | `engine.submit_quote()` (ask>own bid), `engine.market_order()` (skips own orders) | the checks |
-| Two-sided quote requirement / one-sided quotes | `engine.submit_quote()` validation + how `reveal()` builds `bids`/`asks` | allow size 0 on one side |
-| Quotes firm vs. cancelable in the market phase | add a `cancel_quote()` engine function + a host/player action in `server.py`/`app.js` | new feature |
-| Book carried across rounds vs. wiped | `engine.end_market()` (clears), `next_round()` | keep the book instead of clearing |
+| Self-cross / self-trade prohibitions | `engine.submit_quote()` (ask>own bid), `engine._match_incoming()` (skips own orders) | the checks |
+| Two-sided quote requirement / one-sided quotes | `engine.submit_quote()` validation | allow size 0 on one side |
+| Book carried across days vs. wiped overnight | `engine.end_day()` | keep the book instead of clearing |
 | Number of public cards, deal pools | `engine.start_game()` | the dealing block |
 | Scoring formula | `engine.settle()` | `total = cash + pos*V` |
 
@@ -238,7 +238,8 @@ Classroom playbook with the built-in knobs: run a clean baseline game; rematch w
 deck's transaction-cost proposition); rematch with `informedCount` well below the
 player count and watch the market maker's adverse-selection problem appear for real;
 turn on **anonymity** and see how much harder inference from the tape gets; change an
-**ace's value** between rounds as a public news shock and watch the repricing.
+**ace's value** mid-game (or overnight, between days) as a public news shock and watch
+the repricing.
 
 ### Recipe: promoting a rule to a host-controllable setting
 
@@ -249,7 +250,7 @@ touch points in the code as the reference example. The same steps apply to any k
    (see `'feePerUnit': 0`).
 2. **Validate** — `engine.set_settings()`: add a clause (range-check it; decide whether
    it is *lobby-only* — anything that affects dealt cards/roles must be, like
-   `informedCount` — or *live-tunable* like the timers, fee, anonymity and card
+   `informedCount` — or *live-tunable* like the day clock, fee, anonymity and card
    values). Note the whole function validates-then-commits: on any error it restores
    the previous settings.
 3. **Apply** — wherever the rule bites (the fee lives in `engine._apply_trade()`, which
@@ -278,10 +279,11 @@ touch points in the code as the reference example. The same steps apply to any k
 
 ### Snapshot compatibility
 
-Each `state/<CODE>.json` is a dump of that room's game dict. After changing the state
-*shape*, old snapshots may lack your new keys — either read them defensively
-(`settings.get('feePerUnit', 0)`) or just restart with `--fresh` after deploying a
-rules change. Mid-game rule upgrades are not worth supporting.
+Each `state/<CODE>.json` is a dump of that room's game dict. The dict carries
+`gameVersion` (`engine.GAME_VERSION`); `load_rooms` silently discards snapshots from a
+different version at boot. So after changing the state *shape*, bump `GAME_VERSION` —
+old rooms are dropped instead of resuming into rules they weren't played under.
+Mid-game rule upgrades are not worth supporting.
 
 ---
 
@@ -313,7 +315,7 @@ This produces real adverse selection: a market maker quoting against a mixed cro
 cannot tell whether the order hitting them is informed — which is precisely
 Propositions 1–5 territory. (Defaulting `informedCount` to "everyone" reproduces the
 original game exactly, and `informedCount = 0` gives a pure common-knowledge baseline
-round.)
+market.)
 
 ### Host setting & assignment (as built)
 
