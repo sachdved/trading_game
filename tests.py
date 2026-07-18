@@ -898,7 +898,10 @@ def test_integration():
         code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['phase'] == 'settled', 'closing the last day settled the game')
         stl = st['settlement']
-        pub = sum(E.card_points(c) for c in stl['publicCards'])
+        # the day-2 event draw may have been a value shock — score with the
+        # game's CURRENT card values, exactly like the engine does
+        vals = st['settings']['cardValues']
+        pub = sum(E.card_points(c, vals) for c in stl['publicCards'])
         priv = sum(r['cardPoints'] for r in stl['rows'])
         ok(stl['V'] == pub + priv, 'V = all public + private points')
         for r in stl['rows']:
