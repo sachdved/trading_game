@@ -16,6 +16,7 @@ Flags: --fresh  (discard all saved room snapshots and start clean)
 
 Views served:
   /                     landing page (create a room / join by code)
+  /practice             solo practice table (self-contained tutorial)
   /r/CODE               player view (join from phones)
   /r/CODE/board         projector view (public info only)
   /r/CODE/host?key=K    host control panel (key issued at room creation)
@@ -331,9 +332,10 @@ def rearm(room):
     if room.timer:
         room.timer.cancel()
         room.timer = None
-    deadline = room.game.get('deadline')
-    if deadline is not None:
-        delay = max(0.0, (deadline - now_ms()) / 1000) + 0.03
+    g = room.game
+    deadlines = [d for d in (g.get('deadline'), g.get('eventDeadline')) if d is not None]
+    if deadlines:
+        delay = max(0.0, (min(deadlines) - now_ms()) / 1000) + 0.03
         room.timer = threading.Timer(delay, fire, args=(room,))
         room.timer.daemon = True
         room.timer.start()
@@ -442,6 +444,8 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path.rstrip('/') or '/'
         if path == '/':
             return self.serve_static('index.html')
+        if path in ('/practice', '/learn'):
+            return self.serve_static('practice.html')
         if path in ('/app.js', '/style.css'):
             return self.serve_static(path.lstrip('/'))
         if path == '/healthz':

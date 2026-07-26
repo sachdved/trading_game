@@ -557,12 +557,51 @@ def test_event_cards():
     ok(len(g3['events']) == 1 and g3['events'][0]['day'] == 2, 'day open auto-drew an event')
 
 
+def test_event_timer():
+    # events on with an interval: one at the day open, then every interval via the clock
+    g, ps = make_game(['A', 'B'], started=False, days=1)
+    g['settings']['daySeconds'] = 0            # manual day, so only the event clock ticks
+    E.set_settings(g, {'eventCards': True, 'eventEverySeconds': 60}, NOW)
+    E.start_game(g, NOW, random.Random(5))
+    ok(len(g['events']) == 1, 'an event is dealt at the start of the day')
+    ok(g['eventDeadline'] == NOW + 60_000, 'the next event is armed one interval out')
+    # neutralize the opening card's side effects, then rig harmless draws
+    g['deadline'] = None
+    g['eventDeck'] = ['dividend', 'levy']      # positions are flat, so these do nothing
+    ok(E.on_deadline(g, NOW + 59_000, random.Random(0)) is None, 'nothing before the interval')
+    ok(len(g['events']) == 1, 'still just the opening event')
+    ok(E.on_deadline(g, NOW + 60_001, random.Random(0)) == 'event', 'the interval fires an event')
+    ok(len(g['events']) == 2, 'a second event was dealt on the clock')
+    ok(g['eventDeadline'] == NOW + 60_001 + 60_000, 'the clock re-armed for the next interval')
+    E.end_day(g, NOW + 70_000)                 # days=1 -> settles
+    ok(g['eventDeadline'] is None and g['phase'] == 'settled', 'closing clears the event clock')
+
+    # interval 0 = only at the day open, no periodic ticks
+    g2, _ = make_game(['C', 'D'], started=False)
+    g2['settings']['daySeconds'] = 0
+    E.set_settings(g2, {'eventCards': True, 'eventEverySeconds': 0}, NOW)
+    E.start_game(g2, NOW, random.Random(6))
+    ok(len(g2['events']) == 1 and g2['eventDeadline'] is None,
+       'interval 0 draws at open but arms no periodic clock')
+
+    expect_error(lambda: E.set_settings(E.create_game(), {'eventEverySeconds': 5}, NOW),
+                 '15-3600')
+
+    # toggling events mid-day arms / clears the clock immediately
+    g4, _ = make_game(['E', 'F'])              # started, open, day clock manual
+    g4['settings']['daySeconds'] = 0
+    E.set_settings(g4, {'eventCards': True, 'eventEverySeconds': 30}, NOW)
+    ok(g4['eventDeadline'] == NOW + 30_000, 'enabling events mid-day arms the clock')
+    E.set_settings(g4, {'eventCards': False}, NOW)
+    ok(g4['eventDeadline'] is None, 'disabling events clears the clock')
+
+
 UNIT_TESTS = [test_cards, test_lobby_and_roles, test_settings_days, test_deal,
               test_deal_full_pool, test_quote_validation, test_continuous_matching,
               test_market_orders, test_day_flow_and_settle,
               test_kick_and_deadline, test_view_privacy,
               test_informed_axis, test_fee_and_anonymous, test_card_values,
-              test_player_cap, test_margin_interest, test_event_cards]
+              test_player_cap, test_margin_interest, test_event_cards, test_event_timer]
 
 
 # ================================================================ multi-room units
@@ -738,6 +777,10 @@ def test_integration():
         for path in ('/', '/app.js', '/style.css'):
             code, body = req('GET', path)
             ok(code == 200, f'{path} serves')
+
+        # the solo practice table serves as its own page
+        code, body = req('GET', '/practice')
+        ok(code == 200 and b'Practice Table' in body, '/practice serves the trainer')
 
         # create two rooms
         code, r1 = req('POST', '/api/rooms', {})

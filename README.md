@@ -7,6 +7,10 @@ positions, and settles the game — nobody has to keep an order book by hand.
 
 Nothing to install beyond Python: 100% standard library (3.9+), one folder, no build.
 
+**New players can learn solo first:** the landing page (and the in-game Rules button) links
+to a **practice table** at `/practice` — a self-contained tutorial that drills estimating
+the value, buying/selling/passing on a quote, and reading the order flow, no room needed.
+
 ## Play it with friends (2 minutes)
 
 One person hosts on a laptop; everyone else joins from their phone **on the same wifi**.
@@ -86,7 +90,8 @@ the days (automatic when the day clock is on). `+30s` and close-now buttons over
 - **Overnight:** when a day ends, outstanding forced orders execute against what's left
   of the book, all resting orders are canceled, and margin interest (if set) is charged
   on negative cash. Positions and cash carry into the next day's empty book.
-- **Event cards (optional):** public news drawn at day opens or by the host — value and
+- **Event cards (optional):** public news dealt at each day open, then automatically on a
+  repeating timer (default ~once a minute) and whenever the host draws one — value and
   fee shocks, dividends and levies, flash closes — plus private forced orders that
   inject noise-trader flow nobody can attribute.
 - **Settlement:** V = sum of the points of **all** dealt cards (public + every private
@@ -114,7 +119,7 @@ takers take — use "everyone" mode (good for small groups) to let all players d
 | Day clock | 300s | length of each trading day; 0 = the host closes days manually; changeable mid-game (applies from the next day) |
 | Max players | deck limit | host cap on seats in this room (2–49); the deck still caps it when lower. Server-wide caps (rooms, connections) are env vars — see EXTENDING.md |
 | Margin rate | 0 %/day | negative cash is a margin loan: charged this rate at every day close; the take is reported at settlement like fees |
-| Event cards | off | one card auto-draws each time a later day opens, plus a host **Draw event** button: value shocks, fee changes, dividends/levies, forced anonymity, flash closes — and private **forced orders** (one trader must buy/sell before the close; unfilled parts execute automatically) |
+| Event cards | off | when on, a card is dealt at each day open and then every **New event every** seconds (default 60; 0 = only at day open), plus a host **Draw event** button: value shocks, fee changes, dividends/levies, forced anonymity, flash closes — and private **forced orders** (one trader must buy/sell before the close; unfilled parts execute automatically) |
 | Players dealt a card | everyone | set *k* to create **informed vs. uninformed** traders: k random players get a card, the rest get nothing (worth 0). The count is public; *who* is secret — even from the host. Settlement compares the groups' average scores. |
 | Exchange fee per unit | 0 | charged to **both** sides of every fill and kept by the exchange; flip it on between rounds and watch spreads widen |
 | Anonymous trading | off | book, tape and standings show stable pseudonyms (Trader 1, 2, …) until settlement; the host still sees real names |
@@ -183,7 +188,8 @@ server.py                    multi-room HTTP + Server-Sent-Events server, timers
                              room registry, rate limits, per-room persistence
 engine.py                    game rules: dealing, matching, market orders, scoring
 public/                      the web client (landing / player / host / board views)
-tests.py                     257 checks: matching, scoring, privacy, rooms, reaper,
+public/practice.html         solo practice table — a self-contained tutorial (/practice)
+tests.py                     270 checks: matching, scoring, privacy, rooms, reaper,
                              rate limits, seat takeover, full-game HTTP run
 Start_Trading_Game.command   macOS double-click launcher
 start-trading-game.bat       Windows double-click launcher

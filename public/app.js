@@ -300,7 +300,8 @@ function settingsLine(S) {
     parts.push(`Points: A=${vals.A}, K=${vals.K}, Q=${vals.Q}, J=${vals.J}`);
   if (+s.feePerUnit > 0) parts.push(`Fee: ${fmt(s.feePerUnit)}/unit`);
   if (+s.marginRate > 0) parts.push(`Margin: ${fmt(s.marginRate)}%/day`);
-  if (s.eventCards) parts.push('Event cards on');
+  if (s.eventCards) parts.push(+s.eventEverySeconds > 0
+    ? `Events every ${s.eventEverySeconds}s` : 'Event cards on');
   if (s.maxPlayers) parts.push(`Max ${s.maxPlayers} players`);
   if (s.anonymous) parts.push('Anonymous trading');
   return parts.join(' · ');
@@ -483,6 +484,12 @@ function buildLanding() {
           <button class="btn big" type="submit">Join</button>
         </form>
         <div id="joinroommsg"></div>
+      </div>
+      <div class="panel">
+        <h2>New here?</h2>
+        <p class="small muted">Practice solo against a simulated table — estimate the value,
+        trade a quote, and learn to read the order flow. No room needed.</p>
+        <a class="btn big" href="/practice">🎓 Open the practice table</a>
       </div>
       <p class="footer-note"><a href="#" data-action="rules">How the game works</a></p>
     </div>`;
@@ -682,9 +689,11 @@ function liveTweaksForm(S) {
     <div class="formrow">
       <div class="field"><label>Margin rate (%/day)</label>
         <input type="number" id="set-margin" min="0" max="20" step="any" value="${s.marginRate ?? 0}"></div>
-      <div class="field"><label>Event cards (auto-draw)</label>
+      <div class="field"><label>Event cards</label>
         <select id="set-events"><option value="off">Off</option>
           <option value="on" ${s.eventCards ? 'selected' : ''}>On</option></select></div>
+      <div class="field"><label>New event every (s, 0 = day open)</label>
+        <input type="number" id="set-eventsec" min="0" max="3600" step="5" value="${s.eventEverySeconds ?? 60}"></div>
     </div>
     ${cardValueFields(s)}
     <button class="btn" type="submit">Apply from now on</button>
@@ -772,8 +781,13 @@ function buildHost(S) {
           <div class="field"><label>Event cards</label>
             <select id="set-events">
               <option value="off">Off</option>
-              <option value="on" ${s.eventCards ? 'selected' : ''}>On — auto-draw at each day open</option>
+              <option value="on" ${s.eventCards ? 'selected' : ''}>On — news drops during play</option>
             </select></div>
+          <div class="field"><label>New event every (s, 0 = only at day open)</label>
+            <input type="number" id="set-eventsec" min="0" max="3600" step="5"
+                   value="${s.eventEverySeconds ?? 60}"></div>
+        </div>
+        <div class="formrow">
           <div class="field"><label>Anonymous trading</label>
             <select id="set-anon">
               <option value="off">Off — real names</option>
@@ -912,6 +926,7 @@ document.addEventListener('submit', async e => {
       if ($('set-fee')) st.feePerUnit = +$('set-fee').value;
       if ($('set-margin')) st.marginRate = +$('set-margin').value;
       if ($('set-events')) st.eventCards = $('set-events').value === 'on';
+      if ($('set-eventsec')) st.eventEverySeconds = +$('set-eventsec').value;
       if ($('set-anon')) st.anonymous = $('set-anon').value === 'on';
       if ($('set-cv-A')) st.cardValues = Object.fromEntries(
         ['A', 'K', 'Q', 'J'].map(r => [r, +$('set-cv-' + r).value]));
@@ -1010,15 +1025,17 @@ function showRules() {
         best resting price(s), first come first served; big orders walk the book.</li>
       <li><b>Trading days:</b> the session can run over several "days". Overnight the book is
         wiped (positions and cash carry over); after the last day the market settles.</li>
-      <li><b>Event cards (host option):</b> news can land when a day opens or whenever the host
-        draws a card — value shocks, fee changes, dividends and levies… and sometimes a
+      <li><b>Event cards (host option):</b> news lands at each day open and then on a repeating
+        timer (default about once a minute), plus whenever the host draws a card — value
+        shocks, fee changes, dividends and levies… and sometimes a
         <b>private order</b> forcing one trader to buy or sell before the close. Nobody else
         knows who got it; the unfilled part executes automatically at the close.</li>
       <li><b>Margin (host option):</b> negative cash is a margin loan — it is charged the set
         interest rate at every day close.</li>
       <li><b>Scoring:</b> cash from your fills <b>+ net position × V</b>. Shorts are fine;
         so are negative scores. Trade on what you know — and on what others' trades tell you.</li>
-    </ul>`;
+    </ul>
+    <p class="center" style="margin-top:6px"><a class="btn" href="/practice" target="_blank" rel="noopener">🎓 Practice solo at the training table ↗</a></p>`;
   $('modal').classList.remove('hidden');
 }
 

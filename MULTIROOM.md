@@ -53,7 +53,7 @@ untouched — it always operated on a game dict passed in.
   page at `/`, and a friendly "room expired" page when a code is dead.
 
 The full env-var contract lives in [EXTENDING.md](EXTENDING.md) §1. Tests:
-`python3 tests.py` — 257 checks including two-room isolation, cross-room key
+`python3 tests.py` — 270 checks including two-room isolation, cross-room key
 rejection, the reaper, TTL tiers, rate limiting (incl. X-Forwarded-For keying),
 connection caps, seat takeover, and a full game over HTTP.
 
