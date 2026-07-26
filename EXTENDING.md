@@ -225,7 +225,7 @@ those plus the rules that are still one-line code edits:
 | Quote pulling (cancels) | **built in** — `engine.cancel_quotes()` + `/api/cancel` | forbid it to make quotes firm again |
 | Seats per room | **built in** — lobby setting `maxPlayers` (server-wide caps are env vars) | `engine.capacity()` |
 | Margin interest on borrowed cash | **built in** — setting `marginRate` (%/day), charged in `engine._charge_margin()` at day close | pay interest on positive cash too, or charge shorts |
-| Event cards | **built in** — setting `eventCards` (auto-draw at day opens) + host `event` action | add/edit cards in `engine.EVENT_CARDS` + `_apply_event()`; forced-order flow in `_execute_forced()` |
+| Event cards | **built in** — settings `eventCards` + `eventEverySeconds` (day-open + interval deals; the clock lives in `eventDeadline`, armed by `_arm_event`, fired via `on_deadline`→`_tick_events`) + host `event` action | add/edit cards in `engine.EVENT_CARDS` + `_apply_event()`; forced-order flow in `_execute_forced()` |
 | Who gets information | **built in** — host setting `informedCount` (see section 3) | |
 | What counts as a cross (`bid ≥ ask` vs. strict `>`) | `engine._match_incoming()` | the price-comparison `break` line |
 | Trade price (resting price vs. midpoint) | `engine._match_incoming()` | the `o['price']` passed to `_apply_trade` |

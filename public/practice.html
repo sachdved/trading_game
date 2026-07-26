@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The Trading Game — Practice Table</title>
+<style>
+  :root{
+    --felt-1:#14532d; --felt-2:#052e16; --panel:rgba(6,46,26,.6); --panel2:rgba(6,78,44,.3);
+    --amber:#fbbf24; --cream:#fef3c7; --ink:#052e16; --up:#34d399; --dn:#f87171;
+    --muted:rgba(167,243,208,.7);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:Georgia,'Times New Roman',serif;color:var(--cream);min-height:100vh;
+    background:radial-gradient(ellipse at 50% 20%, var(--felt-1) 0%, var(--felt-2) 70%);
+  }
+  .wrap{max-width:430px;margin:0 auto;padding:24px 16px}
+  .eyebrow{font-size:10px;letter-spacing:.35em;text-transform:uppercase;color:var(--muted);text-align:center}
+  h1{font-size:24px;text-align:center;color:var(--cream);margin:2px 0 14px}
+  .tabs{display:flex;gap:6px;margin-bottom:14px}
+  .tab{flex:1;padding:9px 4px;border:0;border-radius:10px;font-size:12px;font-weight:700;cursor:pointer;
+       background:rgba(6,46,26,.5);color:rgba(167,243,208,.8);font-family:inherit;transition:transform .1s}
+  .tab.on{background:var(--cream);color:var(--ink)}
+  .tab:active{transform:scale(.96)}
+  .chips{display:flex;justify-content:center;gap:8px;margin-bottom:18px}
+  .chip{display:flex;flex-direction:column;align-items:center;padding:6px 14px;border-radius:10px;background:var(--panel)}
+  .chip .l{font-size:9px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+  .chip .v{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:18px;font-weight:700;color:var(--cream)}
+  .chip .v.up{color:var(--up)} .chip .v.dn{color:var(--dn)} .chip .v.gold{color:var(--amber)}
+  .table{border:1px solid rgba(21,128,61,.5);background:var(--panel2);border-radius:18px;padding:16px;margin-bottom:14px;
+         box-shadow:0 12px 30px rgba(0,0,0,.35)}
+  .lbl{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted);text-align:center;margin-bottom:8px}
+  .row{display:flex;justify-content:center;gap:8px;margin-bottom:16px}
+  .split{display:flex;justify-content:space-around;align-items:flex-end}
+  .card{width:56px;height:80px;border-radius:9px;background:#fffbeb;border:1px solid #d6d3d1;
+        box-shadow:0 3px 8px rgba(0,0,0,.3);display:flex;flex-direction:column;align-items:center;justify-content:center;
+        font-weight:700;font-size:18px;color:#1c1917}
+  .card.red{color:#dc2626}
+  .card .suit{font-size:24px}
+  .card.sm{width:40px;height:56px;font-size:14px}
+  .card.sm .suit{font-size:16px}
+  .card.back{background:#065f46;border:2px solid #022c22;color:#a7f3d0;font-size:20px;
+    background-image:repeating-linear-gradient(45deg,rgba(255,255,255,.06) 0 4px,transparent 4px 8px)}
+  .ptline{margin-top:5px;font-family:ui-monospace,Menlo,monospace;font-size:13px;color:#fde68a;text-align:center}
+  .tape{background:#0c0a09;border:1px solid #44403c;border-radius:12px;padding:12px 16px;margin-bottom:14px;
+        font-family:ui-monospace,Menlo,monospace;font-size:13px}
+  .tape .l{font-family:inherit;text-align:left;color:#78716c;margin-bottom:6px}
+  .tape div.t{color:rgba(252,211,77,.9);padding:2px 0}
+  .panel{background:var(--panel);border-radius:14px;padding:16px}
+  .panel.reveal{border:1px solid rgba(251,191,36,.3)}
+  .prompt{font-size:14px;color:#d1fae5;margin-bottom:12px}
+  .sliderow{display:flex;align-items:center;gap:12px}
+  input[type=range]{flex:1;accent-color:var(--amber)}
+  .guessval{font-family:ui-monospace,Menlo,monospace;font-size:24px;font-weight:700;color:#fde68a;width:56px;text-align:right}
+  .btn{width:100%;padding:13px;border:0;border-radius:12px;background:var(--amber);color:var(--ink);
+       font-weight:700;font-size:17px;font-family:inherit;cursor:pointer;margin-top:12px;transition:transform .1s}
+  .btn:active{transform:scale(.97)}
+  .quoterow{display:flex;justify-content:center;gap:28px;margin-bottom:10px}
+  .q{text-align:center}
+  .q .n{font-family:ui-monospace,Menlo,monospace;font-size:24px;font-weight:700}
+  .q .n.bid{color:var(--up)} .q .n.ask{color:var(--dn)}
+  .hint{font-size:12px;color:rgba(209,250,229,.8);text-align:center;margin-bottom:12px}
+  .acts{display:flex;gap:8px}
+  .acts button{flex:1;padding:13px 4px;border:0;border-radius:12px;font-weight:700;font-size:14px;
+               font-family:inherit;cursor:pointer;transition:transform .1s}
+  .acts button:active{transform:scale(.96)}
+  .b-buy{background:#10b981;color:var(--ink)} .b-pass{background:#57534e;color:#f5f5f4} .b-sell{background:#ef4444;color:#fef2f2}
+  .verdict{font-weight:700;font-size:14px;margin-bottom:8px}
+  .verdict.good{color:var(--up)} .verdict.bad{color:var(--dn)}
+  .expl{font-size:14px;color:#d1fae5;line-height:1.5}
+  .expl b{font-family:ui-monospace,Menlo,monospace;color:#fde68a}
+  .taperead{font-size:14px;color:rgba(253,230,138,.9);line-height:1.5;margin-top:8px}
+  .foot{text-align:center;font-size:11px;color:rgba(167,243,208,.5);margin-top:20px}
+  .hide{display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p style="margin-bottom:8px"><a href="/" style="color:var(--muted);text-decoration:none;font-size:13px">&larr; Back to the game</a></p>
+  <div class="eyebrow">The Trading Game</div>
+  <h1>Practice Table</h1>
+
+  <div class="tabs">
+    <button class="tab on" id="tab1" onclick="pickLevel(1)">1. Guess V</button>
+    <button class="tab" id="tab2" onclick="pickLevel(2)">2. Trade a quote</button>
+    <button class="tab" id="tab3" onclick="pickLevel(3)">3. Read the tape</button>
+  </div>
+
+  <div class="chips">
+    <div class="chip"><span class="l">hands</span><span class="v" id="cHands">0</span></div>
+    <div class="chip"><span class="l">correct</span><span class="v" id="cRight">—</span></div>
+    <div class="chip hide" id="chipPnl"><span class="l">p&amp;l</span><span class="v" id="cPnl">0</span></div>
+  </div>
+
+  <div class="table">
+    <div class="lbl">Public cards — everyone sees these</div>
+    <div class="row" id="pubRow"></div>
+    <div class="split">
+      <div>
+        <div class="lbl">Your card</div>
+        <div class="row" style="margin-bottom:0" id="mineRow"></div>
+        <div class="ptline" id="minePts"></div>
+      </div>
+      <div>
+        <div class="lbl">3 hidden cards</div>
+        <div class="row" style="margin-bottom:0;gap:6px" id="botRow"></div>
+        <div class="ptline" id="botPts"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tape hide" id="tapeBox">
+    <div class="l">THE TAPE — WATCH BEFORE YOU ACT</div>
+    <div id="tapeLines"></div>
+  </div>
+
+  <div class="panel" id="guessPanel">
+    <div class="prompt">What's the total value <b>V</b> of all 7 cards? (2–10 = face value, K = +20, A = −40, J/Q = 0)</div>
+    <div class="sliderow">
+      <input type="range" id="slider" min="-60" max="110" value="0" oninput="document.getElementById('gv').textContent=this.value">
+      <span class="guessval" id="gv">0</span>
+    </div>
+    <button class="btn" onclick="submitGuess()">Lock in guess</button>
+  </div>
+
+  <div class="panel hide" id="tradePanel">
+    <div class="quoterow">
+      <div class="q"><div class="lbl">Maker bids</div><div class="n bid" id="qBid"></div></div>
+      <div class="q"><div class="lbl">Maker asks</div><div class="n ask" id="qAsk"></div></div>
+    </div>
+    <div class="hint">Buy at the ask, sell at the bid, or pass. Is the market cheap or expensive vs. your estimate?</div>
+    <div class="acts">
+      <button class="b-buy" onclick="trade('buy')" id="btnBuy"></button>
+      <button class="b-pass" onclick="trade('pass')">PASS</button>
+      <button class="b-sell" onclick="trade('sell')" id="btnSell"></button>
+    </div>
+  </div>
+
+  <div class="panel reveal hide" id="revealPanel">
+    <div class="chips" style="margin-bottom:12px">
+      <div class="chip"><span class="l">true V</span><span class="v gold" id="rV"></span></div>
+      <div class="chip"><span class="l">smart estimate</span><span class="v" id="rEst"></span></div>
+      <div class="chip hide" id="chipMid"><span class="l">mid</span><span class="v" id="rMid"></span></div>
+    </div>
+    <div class="verdict" id="rVerdict"></div>
+    <div class="expl" id="rExpl"></div>
+    <div class="taperead hide" id="rTape"></div>
+    <button class="btn" onclick="deal()">Deal next hand</button>
+  </div>
+
+  <div class="foot">Level 1 trains the estimate · Level 2 trains buy/sell/pass · Level 3 trains reading order flow<br>
+    <a href="/" style="color:var(--muted)">Ready? Create or join a real game &rarr;</a></div>
+</div>
+
+<script>
+"use strict";
+const RANKS=["2","3","4","5","6","7","8","9","10","J","Q","K","A"];
+const pts=r=>r==="A"?-40:r==="K"?20:(r==="J"||r==="Q")?0:parseInt(r);
+const DECK_TOTAL=68, DECK_N=26;
+let level=1, hand=null, done=false;
+let score={hands:0,right:0,pnl:0};
+
+function freshDeck(){
+  const d=[];
+  for(const s of ["h","s"]) for(const r of RANKS) d.push({r,s});
+  for(let i=d.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[d[i],d[j]]=[d[j],d[i]];}
+  return d;
+}
+function dealHand(){
+  const deck=freshDeck();
+  const pub=deck.slice(0,3), mine=deck[3], bots=deck.slice(4,7);
+  const trueV=[...pub,mine,...bots].reduce((a,c)=>a+pts(c.r),0);
+  const known=pub.reduce((a,c)=>a+pts(c.r),0)+pts(mine.r);
+  const poolAvg=(DECK_TOTAL-known)/(DECK_N-4);
+  const est=Math.round((known+3*poolAvg)*10)/10;
+  const lean=0.45+Math.random()*0.25;
+  const mid=lean*trueV+(1-lean)*est+(Math.random()*8-4);
+  const half=2+Math.random()*2.5;
+  const bid=Math.round((mid-half)*2)/2, ask=Math.round((mid+half)*2)/2;
+  let tape=[];
+  if(level===3){
+    const names=["Trader B","Trader C","Trader D"];
+    tape=bots.map((c,i)=>{
+      const p=pts(c.r); let act,why;
+      if(p<=-20){act="sells 5 into the bid";why="ace";}
+      else if(p>=15){act="lifts the ask for 5";why="king";}
+      else if(p>=8){act=Math.random()<.6?"buys 2 at the ask":"sits quietly";why="high";}
+      else {act=Math.random()<.5?"sits quietly":(Math.random()<.5?"buys 1":"sells 1");why="noise";}
+      return {name:names[i],act,why};
+    }).sort(()=>Math.random()-.5);
+  }
+  return {pub,mine,bots,trueV,est,bid,ask,tape,poolAvg,known};
+}
+function cardEl(c,hidden,small){
+  const d=document.createElement("div");
+  if(hidden){d.className="card back"+(small?" sm":"");d.textContent="?";return d;}
+  d.className="card"+(c.s==="h"?" red":"")+(small?" sm":"");
+  d.innerHTML="<span>"+c.r+"</span><span class='suit'>"+(c.s==="h"?"♥":"♠")+"</span>";
+  return d;
+}
+function show(id,on){document.getElementById(id).classList[on?"remove":"add"]("hide");}
+function render(){
+  const pub=document.getElementById("pubRow"); pub.innerHTML="";
+  hand.pub.forEach(c=>pub.appendChild(cardEl(c)));
+  const mine=document.getElementById("mineRow"); mine.innerHTML="";
+  mine.appendChild(cardEl(hand.mine));
+  const mp=pts(hand.mine.r);
+  document.getElementById("minePts").textContent=(mp>=0?"+":"")+mp+" pts";
+  const bots=document.getElementById("botRow"); bots.innerHTML="";
+  hand.bots.forEach(c=>bots.appendChild(cardEl(c,!done,true)));
+  document.getElementById("botPts").textContent=done?hand.bots.map(c=>pts(c.r)).join(", "):"";
+  show("tapeBox",level===3);
+  if(level===3){
+    const tl=document.getElementById("tapeLines"); tl.innerHTML="";
+    hand.tape.forEach(t=>{const d=document.createElement("div");d.className="t";d.textContent="▸ "+t.name+" "+t.act;tl.appendChild(d);});
+  }
+  show("guessPanel",level===1&&!done);
+  show("tradePanel",level>1&&!done);
+  show("revealPanel",done);
+  show("chipPnl",level>1);
+  if(level>1&&!done){
+    document.getElementById("qBid").textContent=hand.bid.toFixed(1);
+    document.getElementById("qAsk").textContent=hand.ask.toFixed(1);
+    document.getElementById("btnBuy").textContent="BUY @ "+hand.ask.toFixed(1);
+    document.getElementById("btnSell").textContent="SELL @ "+hand.bid.toFixed(1);
+  }
+  document.getElementById("cHands").textContent=score.hands;
+  document.getElementById("cRight").textContent=score.hands?Math.round(100*score.right/score.hands)+"%":"—";
+  const pnlEl=document.getElementById("cPnl");
+  pnlEl.textContent=(score.pnl>=0?"+":"")+(Math.round(score.pnl*10)/10);
+  pnlEl.className="v "+(score.pnl>=0?"up":"dn");
+}
+function deal(){hand=dealHand();done=false;
+  document.getElementById("slider").value=0;document.getElementById("gv").textContent="0";render();}
+function pickLevel(lv){level=lv;
+  [1,2,3].forEach(i=>document.getElementById("tab"+i).classList[i===lv?"add":"remove"]("on"));deal();}
+function reveal(vHtml,verdictOk,explHtml,tapeHtml){
+  done=true;render();
+  document.getElementById("rV").textContent=hand.trueV;
+  document.getElementById("rEst").textContent=hand.est;
+  show("chipMid",level>1);
+  if(level>1)document.getElementById("rMid").textContent=((hand.bid+hand.ask)/2).toFixed(1);
+  const v=document.getElementById("rVerdict");v.innerHTML=vHtml;v.className="verdict "+(verdictOk?"good":"bad");
+  document.getElementById("rExpl").innerHTML=explHtml;
+  show("rTape",!!tapeHtml);
+  if(tapeHtml)document.getElementById("rTape").innerHTML=tapeHtml;
+}
+function submitGuess(){
+  const g=+document.getElementById("slider").value;
+  const err=Math.abs(g-hand.trueV);
+  const ok=err<=12;
+  score.hands++; if(ok)score.right++;
+  const msg=err<=5?"Sharp. Within 5 points.":err<=12?"Close enough to trade on.":"Off by a lot — walk through the recipe below.";
+  reveal("You guessed "+g+". True V = "+hand.trueV+". "+msg, ok,
+    "The recipe: known cards total <b>"+hand.known+"</b>. Each hidden card is worth about <b>"+hand.poolAvg.toFixed(1)+
+    "</b> on average, and there are 3 of them → estimate ≈ <b>"+hand.est+
+    "</b>. The gap between the estimate and the truth is the hidden cards surprising you — usually an Ace or King.");
+}
+function trade(side){
+  const edgeBuy=hand.trueV-hand.ask, edgeSell=hand.bid-hand.trueV;
+  let best; if(edgeBuy>1.5)best="buy"; else if(edgeSell>1.5)best="sell"; else best="pass";
+  let pnl=0, right=false;
+  if(side==="buy"){pnl=edgeBuy;right=edgeBuy>0;}
+  if(side==="sell"){pnl=edgeSell;right=edgeSell>0;}
+  if(side==="pass"){right=best==="pass";}
+  score.hands++; if(right)score.right++; score.pnl+=pnl;
+  const edgeTxt=side!=="pass"?" ("+(pnl>=0?"+":"")+pnl.toFixed(1)+" per unit)":"";
+  const why=best==="buy"?"The ask was below true value — the market was selling it too cheap, so buying wins."
+    :best==="sell"?"The bid was above true value — the market was paying too much, so selling wins."
+    :"The quote straddled true value with no real edge either way — passing was the disciplined play.";
+  let tapeHtml="";
+  if(level===3){
+    const reads=hand.tape.map(t=>t.why==="ace"?t.name+" was dumping — that was the Ace (−40).":
+      t.why==="king"?t.name+" was buying hard — that was the King (+20).":null).filter(Boolean);
+    tapeHtml="Tape reads: "+(reads.length?reads.join(" "):"No one traded with urgency — no Ace or King panic in the flow, so lean on your own arithmetic.");
+  }
+  reveal("You chose "+side.toUpperCase()+edgeTxt+". Best play: "+best.toUpperCase()+".", right,
+    "Your smart estimate was <b>"+hand.est+"</b>. True V was <b>"+hand.trueV+"</b>, and the market quoted <b>"+
+    hand.bid.toFixed(1)+" / "+hand.ask.toFixed(1)+"</b>. "+why, tapeHtml);
+}
+deal();
+</script>
+</body>
+</html>

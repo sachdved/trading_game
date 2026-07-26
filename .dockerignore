@@ -1,0 +1,12 @@
+# flyctl launch added from .gitignore
+# Python
+**/__pycache__
+**/*.pyc
+
+# Runtime game state (per-room snapshots; state.json is the legacy v1 snapshot)
+**/state
+**/state.json
+
+# OS cruft
+**/.DS_Store
+fly.toml

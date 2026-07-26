@@ -17,7 +17,8 @@ information" deck):
     left of the book, the book is wiped overnight, and margin interest is
     charged on negative cash (host-set rate, default 0). Positions and cash
     carry over; after the last day the game settles.
-  * Event cards (optional): drawn automatically when a later day opens and
+  * Event cards (optional): dealt automatically at each day open and then on
+    a repeating interval while the day is open (host-set, default 60s), plus
     on demand by the host — public value/rule shocks, dividends and levies,
     and private forced orders (noise-trader flow).
   * Settlement: V = sum of points of ALL dealt cards; score = cash + pos * V.
@@ -27,7 +28,7 @@ information" deck):
 
 import secrets
 
-GAME_VERSION = 3          # bump when the game dict shape changes (snapshots)
+GAME_VERSION = 4          # bump when the game dict shape changes (snapshots)
 
 RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
 SUITS = ['h', 's', 'd', 'c']
@@ -87,7 +88,8 @@ def create_game():
             'informedCount': None,    # players dealt a private card; None = everyone
             'feePerUnit': 0,          # exchange fee charged to BOTH sides, per unit
             'marginRate': 0,          # % per day charged on negative cash at day close
-            'eventCards': False,      # auto-draw an event card at each later day open
+            'eventCards': False,      # deal event cards automatically during play
+            'eventEverySeconds': 60,  # when eventCards on: 0 = only at day open, else interval
             'anonymous': False,       # pseudonyms on book/tape/standings until settlement
             'cardValues': dict(DEFAULT_CARD_VALUES),   # host-manipulable A/K/Q/J points
         },
@@ -102,7 +104,8 @@ def create_game():
         'feesCollected': 0,           # exchange take when feePerUnit > 0 (burned)
         'interestPaid': 0,            # margin interest collected at day closes (burned)
         'log': [],
-        'deadline': None,             # epoch ms or None
+        'deadline': None,             # day clock: epoch ms or None
+        'eventDeadline': None,        # next periodic event draw: epoch ms or None
         'settlement': None,
     }
 
@@ -244,8 +247,14 @@ def set_settings(game, patch, now):
             if not (0 <= v <= 20):
                 raise GameError('The margin rate must be between 0 and 20 percent per day.')
             s['marginRate'] = v
-        if 'eventCards' in patch:  # live-tunable: governs auto-draws at day opens
+        if 'eventCards' in patch:  # live-tunable: master on/off for auto-dealt events
             s['eventCards'] = bool(patch['eventCards'])
+        if 'eventEverySeconds' in patch:  # live-tunable: 0 = day-open only, else interval
+            v = _num(patch['eventEverySeconds'], 'interval')
+            if v != int(v) or (v != 0 and not (15 <= v <= 3600)):
+                raise GameError('The event interval must be 0 (only at day open) '
+                                'or 15-3600 seconds.')
+            s['eventEverySeconds'] = int(v)
         if 'feePerUnit' in patch:  # live-tunable: applies to trades from now on
             v = round2(_num(patch['feePerUnit'], 'fee'))
             if not (0 <= v <= 10):
@@ -300,6 +309,8 @@ def set_settings(game, patch, now):
         raise
     if s['roles'] != old.get('roles'):
         _reassign_roles(game)
+    if 'eventCards' in patch or 'eventEverySeconds' in patch:
+        _arm_event(game, now)   # start/stop/retime the event clock immediately
     note(game, 'Settings updated', now)
 
 
@@ -383,11 +394,13 @@ def start_game(game, now, rng):
         p['forced'] = None
     ds = game['settings']['daySeconds']
     game['deadline'] = now + ds * 1000 if ds > 0 else None
+    game['eventDeadline'] = None
     days = game['settings']['days']
     dealt = ('everyone holds a private card' if k_eff == len(players) else
              f'{k_eff} of {len(players)} players hold a private card (who — secret)')
     note(game, f'Market open with {len(players)} players — {dealt}'
                + (f'; day 1 of {days}' if days > 1 else ''), now)
+    _open_day_events(game, now, rng)
 
 
 def _execute_forced(game, now):
@@ -422,6 +435,7 @@ def _close_day(game, now):
     _execute_forced(game, now)
     game['book'] = {'bids': [], 'asks': []}
     _charge_margin(game, now)
+    game['eventDeadline'] = None   # the event clock only ticks during an open day
 
 
 def end_day(game, now):
@@ -447,11 +461,39 @@ def next_day(game, now, rng):
     ds = game['settings']['daySeconds']
     game['deadline'] = now + ds * 1000 if ds > 0 else None
     note(game, f"Day {game['day']} of {game['settings']['days']} — market open", now)
-    if game['settings'].get('eventCards'):
-        draw_event(game, now, rng)
+    _open_day_events(game, now, rng)
 
 
 # ---------------------------------------------------------------- event cards
+
+def _arm_event(game, now):
+    """Set (or clear) the deadline for the next periodic event draw."""
+    every = game['settings'].get('eventEverySeconds') or 0
+    if game['phase'] == 'open' and game['settings'].get('eventCards') and every > 0:
+        game['eventDeadline'] = now + every * 1000
+    else:
+        game['eventDeadline'] = None
+
+
+def _open_day_events(game, now, rng):
+    """At a day open: deal the opening event (if on) and start the interval clock."""
+    if game['settings'].get('eventCards'):
+        try:
+            draw_event(game, now, rng)
+        except GameError:
+            pass   # e.g. no applicable card yet — the interval clock still starts
+    _arm_event(game, now)
+
+
+def _tick_events(game, now, rng):
+    """A periodic event tick fired by the clock: deal one, then re-arm the clock."""
+    _arm_event(game, now)   # reschedule first so a draw error can't stop the stream
+    try:
+        draw_event(game, now, rng)
+    except GameError:
+        pass
+
+
 
 EVENT_CARDS = [
     {'id': 'ace-crash',   'headline': 'Rating downgrade — Aces fall 30 points'},
@@ -732,6 +774,7 @@ def _settle(game, now):
                           'anonymous': bool(game['settings'].get('anonymous'))}
     game['phase'] = 'settled'
     game['deadline'] = None
+    game['eventDeadline'] = None
     winner = rows[0]['name'] if rows else '—'
     note(game, f'Market closed & settled: V = {v}. Top score: {winner}', now)
 
@@ -746,18 +789,22 @@ def rematch(game, now):
         p.update(card=None, cash=0, pos=0, informed=None, alias=None, forced=None)
     game.update(phase='lobby', day=0, publicCards=[], book={'bids': [], 'asks': []},
                 seq=0, trades=[], events=[], eventDeck=[], feesCollected=0,
-                interestPaid=0, settlement=None, deadline=None)
+                interestPaid=0, settlement=None, deadline=None, eventDeadline=None)
     note(game, 'Rematch — back to the lobby with the same players', now)
 
 
 def on_deadline(game, now, rng):
-    """Called by the server when the day clock runs out."""
-    if game['deadline'] is None or now < game['deadline']:
-        return None
-    if game['phase'] == 'open':
-        return 'settle' if end_day(game, now) == 'settled' else 'endDay'
-    game['deadline'] = None
-    return 'clear'
+    """Called by the server when the earliest armed clock (day or event) fires."""
+    if game['deadline'] is not None and now >= game['deadline']:
+        if game['phase'] == 'open':
+            return 'settle' if end_day(game, now) == 'settled' else 'endDay'
+        game['deadline'] = None
+        return 'clear'
+    if (game['phase'] == 'open' and game.get('eventDeadline') is not None
+            and now >= game['eventDeadline']):
+        _tick_events(game, now, rng)
+        return 'event'
+    return None
 
 
 # ---------------------------------------------------------------- views
