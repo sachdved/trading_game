@@ -4,6 +4,7 @@
 Run:  python3 tests.py
 """
 
+import collections
 import json
 import os
 import random
@@ -45,6 +46,7 @@ def expect_error(fn, fragment=''):
 
 
 NOW = 1_000_000_000_000
+RNG3 = random.Random(3)
 
 
 def make_game(names, roles='everyone', started=True, rng=None, days=1):
@@ -308,6 +310,84 @@ def test_kick_and_deadline():
     ok(g2['phase'] == 'settled', 'game settled by the clock')
 
 
+def test_chart_series():
+    """The OHLC series the price chart draws: candles must agree with the raw
+    prints, days must sit side by side, and the payload must stay bounded."""
+    g, ps = make_game(['Ana', 'Bob'], days=2)
+    g['settings']['daySeconds'] = 300
+    ana, bob = ps['Ana']['id'], ps['Bob']['id']
+
+    empty = E.chart_series(g, NOW)
+    ok(empty['candles'] == [] and empty['trades'] == 0 and empty['last'] is None,
+       'no trades yet -> an empty series, not a crash')
+
+    # four prints inside one 10s bucket (300s day / 40 candles -> 10s candles),
+    # then one more a minute later
+    for px, size, t in [(10, 2, NOW), (12, 1, NOW + 1000), (9, 3, NOW + 2000),
+                        (11, 1, NOW + 3000), (14, 2, NOW + 60_000)]:
+        E.submit_quote(g, ana, {'bid': px, 'bidSize': size, 'ask': px + 50,
+                                'askSize': 1}, t)
+        E.market_order(g, bob, 'sell', size, t)
+
+    c = E.chart_series(g, NOW + 60_000)
+    ok(c['bucketMs'] == 10_000, f"day clock sets a 10s candle (got {c['bucketMs']})")
+    ok(c['trades'] == 5 and c['last'] == 14, 'series counts every print, last = latest')
+    ok(c['lo'] == 9 and c['hi'] == 14, 'lo/hi span the whole history')
+    first = c['candles'][0]
+    ok((first['o'], first['h'], first['l'], first['c']) == (10, 12, 9, 11),
+       f'first candle is OHLC of its four prints (got {first})')
+    ok(first['v'] == 7 and first['n'] == 4, 'candle carries volume and print count')
+    ok(c['vmax'] == 7, 'vmax is the busiest bucket')
+    ok(len(c['candles']) == 7, f'the 60s gap is kept as empty buckets (got {len(c["candles"])})')
+    ok([x['n'] for x in c['candles'][1:-1]] == [0] * 5, 'the quiet buckets are empty')
+    ok(all(x['day'] == 1 for x in c['candles']), 'day 1 candles are stamped day 1')
+
+    # an open day runs on to `now` so the live chart shows the clock moving, but
+    # the trailing lull is capped (25% of the day's span, min 10s) — an idle
+    # market must not squash the session's trading into a sliver
+    ok(len(E.chart_series(g, NOW + 65_000)['candles']) == 7, 'a short lull just extends')
+    later = E.chart_series(g, NOW + 90_000)
+    ok(len(later['candles']) == 8,
+       f'a long lull is capped at +15s, not +30s (got {len(later["candles"])})')
+    ok(len(E.chart_series(g, NOW + 3600_000)['candles']) == 8,
+       'an hour of silence does not zoom the chart out')
+
+    # overnight: the gap between days is dropped, not drawn as empty buckets
+    E.end_day(g, NOW + 120_000)
+    E.next_day(g, NOW + 8 * 3600_000, random.Random(1))
+    E.submit_quote(g, ana, {'bid': 20, 'bidSize': 1, 'ask': 70, 'askSize': 1},
+                   NOW + 8 * 3600_000)
+    E.market_order(g, bob, 'sell', 1, NOW + 8 * 3600_000)
+    c2 = E.chart_series(g, NOW + 8 * 3600_000)
+    days = [x['day'] for x in c2['candles']]
+    ok(days.count(2) == 1 and days[-1] == 2, 'day 2 opens a single new candle')
+    ok(len(c2['candles']) < 20, f'the 8h overnight gap is dropped (got {len(c2["candles"])})')
+    ok(c2['candles'][-1]['c'] == 20, "day 2's print closes the last candle")
+
+    # a long manual-close session still ships a bounded series
+    g2, ps2 = make_game(['Ana', 'Bob'])
+    g2['settings']['daySeconds'] = 0
+    a2, b2 = ps2['Ana']['id'], ps2['Bob']['id']
+    for i in range(60):
+        t = NOW + i * 30_000
+        E.submit_quote(g2, a2, {'bid': 10 + i % 5, 'bidSize': 1, 'ask': 90, 'askSize': 1}, t)
+        E.market_order(g2, b2, 'sell', 1, t)
+    c3 = E.chart_series(g2, NOW + 60 * 30_000)
+    ok(len(c3['candles']) <= E.CHART_MAX,
+       f'the series is capped at {E.CHART_MAX} candles (got {len(c3["candles"])})')
+    ok(c3['trades'] == 60, 'the print count still reports the whole session')
+
+    # it rides along in every view, and it never says who traded
+    ex = {'now': NOW + 60_000, 'connections': {}}
+    for kind, pid in (('board', None), ('host', None), ('player', ana)):
+        v = E.view_for(g, kind, pid, ex)
+        ok(v['chart']['candles'], f'{kind} view carries the chart series')
+        blob = json.dumps(v['chart'])
+        ok('Ana' not in blob and 'Bob' not in blob and ana not in blob,
+           f'{kind} chart names nobody')
+        ok(json.dumps(v), f'{kind} view with a chart is JSON serializable')
+
+
 def test_view_privacy():
     g, ps = make_game(['Ana', 'Bob'])
     ana = ps['Ana']['id']
@@ -494,36 +574,29 @@ def test_event_cards():
     expect_error(lambda: E.draw_event(E.create_game(), NOW, rng), 'open')
 
     # rig the deck for deterministic draws
-    g['eventDeck'] = ['ace-crash']
-    r = E.draw_event(g, NOW, rng)
+    r = E.draw_event(g, NOW, rng, 'ace-crash')
     ok(g['settings']['cardValues']['A'] == -70, 'value shock moved the ace')
     ok(g['events'][-1]['id'] == 'ace-crash' and 'Aces' in r['headline'], 'event logged')
 
-    g['eventDeck'] = ['fee-hike']
-    E.draw_event(g, NOW, rng)
+    E.draw_event(g, NOW, rng, 'fee-hike')
     ok(g['settings']['feePerUnit'] == 0.5, 'fee shock raised the fee')
-    g['eventDeck'] = ['fee-holiday']
-    E.draw_event(g, NOW, rng)
+    E.draw_event(g, NOW, rng, 'fee-holiday')
     ok(g['settings']['feePerUnit'] == 0, 'fee holiday zeroed the fee')
 
-    g['eventDeck'] = ['flash-close']
-    E.draw_event(g, NOW, rng)
+    E.draw_event(g, NOW, rng, 'flash-close')
     ok(g['deadline'] == NOW + 60_000, 'flash close set a 60s deadline')
     g['deadline'] = None
 
     # dividends and levies move cash with positions, zero-sum
     E.submit_quote(g, ana, {'bid': 9, 'bidSize': 2, 'ask': 10, 'askSize': 2}, NOW)
     E.market_order(g, bob, 'buy', 2, NOW)   # Bob +2 @ -20 cash; Ana -2 @ +20 cash
-    g['eventDeck'] = ['dividend']
-    E.draw_event(g, NOW, rng)
+    E.draw_event(g, NOW, rng, 'dividend')
     ok(ps['Bob']['cash'] == -14 and ps['Ana']['cash'] == 14, 'dividend pays +3/unit; shorts pay')
-    g['eventDeck'] = ['short-audit']
-    E.draw_event(g, NOW, rng)
+    E.draw_event(g, NOW, rng, 'short-audit')
     ok(ps['Ana']['cash'] == 10 and g['feesCollected'] == 4, 'short audit: shorts pay 2/unit')
 
     # forced orders: private, voluntary fills count, remainder executes at the close
-    g['eventDeck'] = ['forced-buy']
-    E.draw_event(g, NOW, rng)
+    E.draw_event(g, NOW, rng, 'forced-buy')
     target = next(p for p in g['players'].values() if p.get('forced'))
     other = next(p for p in g['players'].values() if not p.get('forced'))
     ok(target['forced']['side'] == 'buy' and 1 <= target['forced']['size'] <= 3,
@@ -556,6 +629,138 @@ def test_event_cards():
     E.next_day(g3, NOW, random.Random(3))
     ok(len(g3['events']) == 1 and g3['events'][0]['day'] == 2, 'day open auto-drew an event')
 
+    # the news scroller replays a session's worth of headlines, not just the last
+    # few — and never the private half of an event
+    g4, ps4 = make_game(['Ana', 'Bob'], days=1)
+    for i in range(E.NEWS_KEPT + 6):
+        E.draw_event(g4, NOW + i * 1000, random.Random(i),
+                     'dividend' if i % 2 else 'levy')
+    ex4 = {'now': NOW, 'connections': {}}
+    news = E.view_for(g4, 'board', None, ex4)['events']
+    ok(len(news) == E.NEWS_KEPT, f'the view carries {E.NEWS_KEPT} headlines (got {len(news)})')
+    ok(news[-1]['i'] == len(g4['events']) - 1, 'and they are the most recent ones')
+    ok(all({'i', 'day', 'headline', 'detail'} == set(n) for n in news),
+       'each headline carries only what the scroller shows')
+    E.draw_event(g4, NOW, random.Random(4), 'forced-sell')
+    target4 = next(p for p in g4['players'].values() if p.get('forced'))
+    for kind, pid in (('board', None), ('host', None), ('player', ps4['Ana']['id'])):
+        head = E.view_for(g4, kind, pid, ex4)['events'][-1]
+        ok(target4['name'] not in json.dumps(head) and str(target4['forced']['size'])
+           not in head['headline'],
+           f'{kind} news does not say who got the private order')
+        ok('private' in head['detail'], f'{kind} news says only that it was private')
+
+
+def test_event_randomization():
+    """Cards are sampled from what can actually land, not dealt off a shuffled
+    deck: sessions differ from each other, a card sits out a cooldown, and a
+    card that would do nothing is never dealt (its headline would be a lie)."""
+    def table():
+        g, ps = make_game(['Ana', 'Bob', 'Cy', 'Dee'])
+        g['settings']['eventCards'] = True
+        return g, ps
+
+    seen, sets, repeats, targets = set(), set(), 0, collections.Counter()
+    for seed in range(120):
+        g, ps = table()
+        rng = random.Random(seed)
+        ids = []
+        for i in range(12):
+            E.draw_event(g, NOW + i * 1000, rng)
+            ev = g['events'][-1]
+            ids.append(ev['id'])
+            if ev['id'] in ('forced-buy', 'forced-sell'):
+                targets[next(p['name'] for p in g['players'].values() if p.get('forced'))] += 1
+            for p in g['players'].values():
+                p['forced'] = None      # so the mandate cards stay drawable
+        for j, e in enumerate(ids):
+            if e in ids[max(0, j - E.EVENT_COOLDOWN):j]:
+                repeats += 1
+        seen.update(ids)
+        sets.add(frozenset(ids))
+    ok(repeats == 0, f'no card repeats inside its {E.EVENT_COOLDOWN}-draw cooldown (got {repeats})')
+    ok(seen == {c['id'] for c in E.EVENT_CARDS}, f'every card is reachable (missed {
+        {c["id"] for c in E.EVENT_CARDS} - seen})')
+    ok(len(sets) > 100, f'sessions draw different cards, not one permutation ({len(sets)}/120)')
+    ok(len(targets) == 4 and min(targets.values()) > sum(targets.values()) / 8,
+       f'mandates spread over every eligible trader ({dict(targets)})')
+
+    # a card that would land as a no-op is held back, and cannot be staged either
+    g, _ = table()
+    ok(not E._event_applicable(g, 'fee-holiday', NOW), 'no fee holiday when trading is free')
+    expect_error(lambda: E.draw_event(g, NOW, random.Random(0), 'fee-holiday'), 'not change')
+    E.draw_event(g, NOW, random.Random(0), 'fee-hike')
+    ok(E._event_applicable(g, 'fee-holiday', NOW), 'once there is a fee, the holiday can land')
+    E.draw_event(g, NOW, random.Random(0), 'dark-pool')
+    ok(not E._event_applicable(g, 'dark-pool', NOW), 'the dark pool only opens once')
+    g['settings']['cardValues'] = {'A': -200, 'K': -200, 'Q': 200, 'J': 200}
+    for eid in ('ace-crash', 'royal-swap', 'face-lift'):
+        ok(not E._event_applicable(g, eid, NOW), f'{eid} is held back at the clamp')
+    ok(E._event_applicable(g, 'king-rally', NOW), 'a king rally still has room')
+    g['deadline'] = NOW + 30_000
+    ok(not E._event_applicable(g, 'flash-close', NOW),
+       'no flash close when the day already ends sooner than that')
+
+    for p in g['players'].values():          # everyone already has an order
+        p['forced'] = {'side': 'buy', 'size': 1}
+    pool = E._event_pool(g, NOW)
+    ok('forced-buy' not in pool and 'forced-sell' not in pool,
+       'mandates are not dealt with nobody left to receive one')
+    expect_error(lambda: E.draw_event(g, NOW, random.Random(0), 'no-such-card'), 'No such event')
+
+
+def test_forced_order_privacy():
+    """The news says a trader must trade; it never says which. Only the trader
+    under the mandate is told, and only in their own payload."""
+    g, ps = make_game(['Ana', 'Bob', 'Cy'])
+    g['settings']['eventCards'] = True
+    E.draw_event(g, NOW, random.Random(3), 'forced-buy')
+    target = next(p for p in g['players'].values() if p.get('forced'))
+    others = [p for p in g['players'].values() if not p.get('forced')]
+    ok(len(others) == 2, 'exactly one trader is under the mandate')
+
+    ev = g['events'][-1]
+    ok('one trader' in ev['headline'] and 'private' in ev['detail'],
+       'the headline is broad and the detail says the rest is private')
+    ok(target['name'] not in ev['headline'] + ev['detail'], 'the event names nobody')
+
+    ex = {'now': NOW, 'connections': {}}
+
+    def mandates(node):
+        """every live forced order anywhere in a payload, however nested"""
+        if isinstance(node, dict):
+            return ([node['forced']] if node.get('forced') else
+                    [m for k, v in node.items() if k != 'forced' for m in mandates(v)])
+        if isinstance(node, list):
+            return [m for v in node for m in mandates(v)]
+        return []
+
+    # nothing anywhere in another audience's payload can pick the trader out
+    for kind, pid in [('board', None), ('host', None)] + [('player', p['id']) for p in others]:
+        v = E.view_for(g, kind, pid, ex)
+        ok(mandates(v) == [], f'{kind} payload carries no live mandate anywhere')
+        ok(target['name'] not in json.dumps(v['events']), f'{kind} news names nobody')
+    for p in others:
+        ok(E.view_for(g, 'player', p['id'], ex)['me']['forced'] is None,
+           f"{p['name']} is not told they have an order")
+    own = E.view_for(g, 'player', target['id'], ex)
+    ok(mandates(own) == [target['forced']], 'the mandate appears in exactly one payload')
+    ok(own['me']['forced']['side'] == 'buy' and own['me']['forced']['size'] >= 1,
+       'and that trader sees their own side and size')
+
+    # the host's own log must not tie a name to the mandate either — names show
+    # up in it (people joined), so this has to be checked line by line
+    log = E.view_for(g, 'host', None, ex)['log']
+    ok(any('must' in e['msg'] for e in log), 'the log does record that a mandate went out')
+    ok(not any(target['name'] in e['msg'] and 'must' in e['msg'] for e in log),
+       'but no single log line names the trader who got it')
+
+    # and it stays private right up to the close, when the fill prints like any
+    # other trade — order flow is public, the instruction never was
+    E.submit_quote(g, others[0]['id'], {'bid': 2, 'bidSize': 5, 'ask': 8, 'askSize': 5}, NOW)
+    E.end_day(g, NOW)
+    ok(all(p['forced'] is None for p in g['players'].values()), 'mandates clear at the close')
+
 
 def test_event_timer():
     # events on with an interval: one at the day open, then every interval via the clock
@@ -567,7 +772,7 @@ def test_event_timer():
     ok(g['eventDeadline'] == NOW + 60_000, 'the next event is armed one interval out')
     # neutralize the opening card's side effects, then rig harmless draws
     g['deadline'] = None
-    g['eventDeck'] = ['dividend', 'levy']      # positions are flat, so these do nothing
+    # positions are flat, so the draws below change no cash
     ok(E.on_deadline(g, NOW + 59_000, random.Random(0)) is None, 'nothing before the interval')
     ok(len(g['events']) == 1, 'still just the opening event')
     ok(E.on_deadline(g, NOW + 60_001, random.Random(0)) == 'event', 'the interval fires an event')
@@ -596,12 +801,200 @@ def test_event_timer():
     ok(g4['eventDeadline'] is None, 'disabling events clears the clock')
 
 
+def _trial_table(names=('Ana', 'Bob', 'Cy', 'Dee'), days=2, hand=None):
+    """A dealt table with investigations on and a hand we choose, so a verdict is
+    a known quantity rather than a coin flip."""
+    g, ps = make_game(list(names), days=days)
+    g['settings'].update(trials=True, trialSeconds=0, indemnityRate=0.5,
+                         falseAccusationFee=6)
+    hand = hand or {'Ana': ('A', 's'), 'Bob': ('K', 'h'), 'Cy': ('Q', 's'), 'Dee': ('7', 'h')}
+    for name, (rank, suit) in hand.items():
+        if name in ps:                 # smaller tables just take the first few
+            ps[name]['card'] = {'rank': rank, 'suit': suit}
+    return g, ps
+
+
+def test_trial_flow_and_payoffs():
+    """A day close opens an investigation; a correct read costs the exposed one
+    indemnity however many people saw it; a wrong one pays the accused."""
+    g, ps = _trial_table()
+    ok([E.card_case(g, ps[n]) for n in ('Ana', 'Bob', 'Cy', 'Dee')]
+       == ['bear', 'bull', None, None],
+       'only the big movers are accusable — an Ace is a bear, a King a bull')
+    ok(E.card_case(g, ps['Dee']) is None,
+       'a 7 is worth something positive but is not a big mover')
+
+    ok(E.end_day(g, NOW) == 'trial', 'closing a day opens the investigation')
+    ok(g['phase'] == 'trial' and not g['book']['bids'], 'the book was still wiped first')
+
+    E.file_accusation(g, ps['Bob']['id'], 'Ana', 'bear', NOW)
+    E.file_accusation(g, ps['Cy']['id'], 'Ana', 'bear', NOW)
+    E.file_accusation(g, ps['Dee']['id'], 'Cy', 'bull', NOW)
+    E.file_accusation(g, ps['Ana']['id'], None, None, NOW)      # abstain
+    ex = {'now': NOW, 'connections': {}}
+    ok(E.view_for(g, 'board', None, ex)['trial'] == {'day': 1, 'of': 4, 'filed': 3},
+       'the public count is filed-of-total and nothing else')
+
+    ok(E.resolve_trial(g, NOW) == 'between', 'resolving goes overnight, not to settlement')
+    # Ana holds the Ace: 40 x 0.5 = 20, split between Bob and Cy
+    ok(ps['Ana']['cash'] == -20, f"the exposed Ace paid one indemnity of 20 (got {ps['Ana']['cash']})")
+    ok(ps['Bob']['cash'] == 10, 'split between the two who read it')
+    ok(ps['Cy']['cash'] == 10 + 6, 'Cy also collected the fee for being wrongly named')
+    ok(ps['Dee']['cash'] == -6, 'the wrong accuser paid the fee')
+    ok(abs(sum(p['cash'] for p in g['players'].values())) < 1e-9,
+       'every indemnity is a transfer: cash still sums to zero')
+    ok(all(p['accusation'] is None for p in g['players'].values()),
+       'accusations are cleared for the next one')
+
+    v = ps['Bob']['verdict']
+    ok(v['correct'] and v['dir'] == 'bear' and v['amount'] == 10, "Bob's verdict is his own")
+    ok(ps['Ana']['verdict'] is None, 'an abstainer gets no verdict')
+    ok(ps['Dee']['verdict']['correct'] is False and ps['Dee']['verdict']['amount'] == -6,
+       'a wrong accuser is told they were wrong')
+
+    rec = g['trials'][-1]
+    ok(rec['filed'] == 3 and rec['exposed'] == 1 and rec['moved'] == 26,
+       f'the record adds up (got {rec})')
+
+    # a second day, and closing the last one settles through the investigation
+    E.next_day(g, NOW, RNG3)
+    ok(E.end_day(g, NOW) == 'trial', 'the last day also opens an investigation')
+    E.file_accusation(g, ps['Cy']['id'], 'Bob', 'bull', NOW)
+    ok(E.resolve_trial(g, NOW) == 'settled', 'resolving the last one settles the game')
+    st = g['settlement']
+    ok(abs(sum(r['total'] for r in st['rows'])) < 1e-9, 'the game is still zero-sum')
+    ok(st['indemnities'] == 26 + 10, 'settlement reports what the investigations moved')
+    ok(len(st['trials']) == 2 and len(st['trials'][1]['rows']) == 1,
+       'and reveals every accusation at the end')
+    ok(ps['Bob']['cash'] == 10 - 10, 'the King paid 20 x 0.5 = 10 for being read')
+
+
+def test_trial_privacy():
+    """The count is public. The accusation is not, the verdict is not, and under
+    anonymity a correct read must not hand over a real name."""
+    g, ps = _trial_table()
+    E.end_day(g, NOW)
+    E.file_accusation(g, ps['Bob']['id'], 'Ana', 'bear', NOW)
+    E.file_accusation(g, ps['Cy']['id'], 'Dee', 'bull', NOW)
+    ex = {'now': NOW, 'connections': {}}
+
+    def accusations(node):
+        """every filed accusation or verdict anywhere in a payload"""
+        if isinstance(node, dict):
+            found = [v for k, v in node.items() if k in ('accusation', 'verdict') and v]
+            return found + [m for k, v in node.items()
+                            if k not in ('accusation', 'verdict') for m in accusations(v)]
+        if isinstance(node, list):
+            return [m for v in node for m in accusations(v)]
+        return []
+
+    for kind in ('board', 'host'):
+        v = E.view_for(g, kind, None, ex)
+        ok(accusations(v) == [], f'{kind} payload carries no accusation at all')
+        ok(v['trial']['filed'] == 2, f'{kind} still sees how many are in')
+        ok('Ana' not in json.dumps(v['trial']), f'{kind} count names nobody')
+    for name in ('Ana', 'Dee'):     # the accused, and an innocent bystander
+        v = E.view_for(g, 'player', ps[name]['id'], ex)
+        ok(accusations(v) == [], f'{name} is not told they have been named')
+    own = E.view_for(g, 'player', ps['Bob']['id'], ex)
+    ok(accusations(own) == [{'target': 'Ana', 'dir': 'bear'}],
+       'Bob sees exactly one accusation: his own')
+    ok(sorted(own['me']['candidates']) == ['Ana', 'Cy', 'Dee'],
+       'and cannot accuse himself')
+
+    E.resolve_trial(g, NOW)
+    for name in ('Ana', 'Dee'):
+        ok(E.view_for(g, 'player', ps[name]['id'], ex)['me']['verdict'] is None,
+           f'{name} learns nothing from being accused')
+
+    # anonymity: accuse the pseudonym, hear about the pseudonym
+    g2, ps2 = _trial_table()
+    g2['settings']['anonymous'] = True
+    E.end_day(g2, NOW)
+    alias = ps2['Ana']['alias']
+    bob2 = E.view_for(g2, 'player', ps2['Bob']['id'], ex)
+    ok(alias in bob2['me']['candidates'] and 'Ana' not in bob2['me']['candidates'],
+       'under anonymity you accuse the alias, not the name')
+    expect_error(lambda: E.file_accusation(g2, ps2['Bob']['id'], 'Ana', 'bear', NOW),
+                 'No such trader')
+    E.file_accusation(g2, ps2['Bob']['id'], alias, 'bear', NOW)
+    E.resolve_trial(g2, NOW)
+    verdict = E.view_for(g2, 'player', ps2['Bob']['id'], ex)['me']['verdict']
+    ok(verdict['correct'] and verdict['target'] == alias,
+       'the verdict is right and still pseudonymous')
+    ok('Ana' not in json.dumps(verdict), 'a correct read does not hand over the real name')
+    ok(E.view_for(g2, 'player', ps2['Bob']['id'], ex)['me']['card'] == ps2['Bob']['card'],
+       'and the accuser still only sees their own card')
+
+
+def test_trial_rules_and_edges():
+    """Validation, the minimum table, materiality tracking the host's values, and
+    the clock."""
+    g, ps = _trial_table()
+    expect_error(lambda: E.file_accusation(g, ps['Bob']['id'], 'Ana', 'bear', NOW),
+                 'No investigation')
+    E.end_day(g, NOW)
+    expect_error(lambda: E.file_accusation(g, ps['Bob']['id'], 'Bob', 'bear', NOW),
+                 'cannot accuse yourself')
+    expect_error(lambda: E.file_accusation(g, ps['Bob']['id'], 'Nobody', 'bear', NOW),
+                 'No such trader')
+    expect_error(lambda: E.file_accusation(g, ps['Bob']['id'], 'Ana', 'sideways', NOW),
+                 'bear or a bull')
+    E.file_accusation(g, ps['Bob']['id'], 'Ana', 'bear', NOW)
+    E.file_accusation(g, ps['Bob']['id'], 'Cy', 'bull', NOW)     # replaces it
+    ok(E.view_for(g, 'player', ps['Bob']['id'], {'now': NOW, 'connections': {}})
+       ['me']['accusation'] == {'target': 'Cy', 'dir': 'bull'}, 'filing again replaces')
+    expect_error(lambda: E.resolve_trial(E.create_game(), NOW), 'No investigation')
+
+    # two players is not a guessing game
+    g2, _ = _trial_table(names=('Ana', 'Bob'), days=2)
+    ok(E.end_day(g2, NOW) == 'between', 'under three players there is no investigation')
+    ok(g2['phase'] == 'between' and not g2['trials'], 'and nothing is recorded')
+
+    # materiality follows the values the host (or an event card) set
+    g3, ps3 = _trial_table()
+    E.set_settings(g3, {'cardValues': {'A': -10, 'K': 20, 'Q': 0, 'J': 0}}, NOW)
+    ok(E.card_case(g3, ps3['Ana']) is None, 'an Ace worth -10 is no longer a big mover')
+    ok(E.card_case(g3, ps3['Bob']) == 'bull', 'the King still is')
+    E.end_day(g3, NOW)
+    E.file_accusation(g3, ps3['Bob']['id'], 'Ana', 'bear', NOW)
+    E.resolve_trial(g3, NOW)
+    ok(ps3['Bob']['cash'] == -6 and ps3['Ana']['cash'] == 6,
+       'so accusing that Ace is now simply wrong')
+
+    # the clock closes it, and settling early honours what was filed
+    g4, ps4 = _trial_table(days=2)
+    g4['settings']['trialSeconds'] = 45
+    E.end_day(g4, NOW)
+    ok(g4['deadline'] == NOW + 45_000, 'the investigation clock is armed')
+    ok(E.on_deadline(g4, NOW + 44_000, RNG3) is None, 'nothing before it runs out')
+    E.file_accusation(g4, ps4['Bob']['id'], 'Ana', 'bear', NOW)
+    ok(E.on_deadline(g4, NOW + 46_000, RNG3) == 'endTrial', 'the clock closes it')
+    ok(g4['phase'] == 'between' and ps4['Bob']['cash'] == 20, 'and it was scored')
+
+    g5, ps5 = _trial_table(days=3)
+    E.end_day(g5, NOW)
+    E.file_accusation(g5, ps5['Cy']['id'], 'Bob', 'bull', NOW)
+    E.settle(g5, NOW)
+    ok(g5['phase'] == 'settled' and ps5['Cy']['cash'] == 10,
+       'settling early still scores the accusations people committed to')
+
+    # off by default: no phase, no state
+    g6, ps6 = _trial_table(days=2)
+    g6['settings']['trials'] = False
+    ok(E.end_day(g6, NOW) == 'between', 'with investigations off a day close goes overnight')
+    ok(E.view_for(g6, 'board', None, {'now': NOW, 'connections': {}})['trial'] is None,
+       'and no view carries a trial')
+
+
 UNIT_TESTS = [test_cards, test_lobby_and_roles, test_settings_days, test_deal,
               test_deal_full_pool, test_quote_validation, test_continuous_matching,
               test_market_orders, test_day_flow_and_settle,
-              test_kick_and_deadline, test_view_privacy,
+              test_kick_and_deadline, test_chart_series, test_view_privacy,
               test_informed_axis, test_fee_and_anonymous, test_card_values,
-              test_player_cap, test_margin_interest, test_event_cards, test_event_timer]
+              test_player_cap, test_margin_interest, test_event_cards,
+              test_event_randomization, test_forced_order_privacy, test_event_timer,
+              test_trial_flow_and_payoffs, test_trial_privacy, test_trial_rules_and_edges]
 
 
 # ================================================================ multi-room units
@@ -937,9 +1330,29 @@ def test_integration():
         ok(code == 200, 'host drew an event card')
         code, st = req('GET', f'/r/{A}/api/state?key={KA}')
         ok(st['events'] and st['events'][-1]['headline'], 'the event shows up in state')
+        # investigations over HTTP: turn them on, close the last day into one,
+        # file an accusation, and have the host close it
+        code, _ = host(A, KA, 'settings', settings={'trials': True, 'trialSeconds': 0})
+        ok(code == 200, 'investigations can be switched on mid-game')
         code, _ = host(A, KA, 'endDay')
         code, st = req('GET', f'/r/{A}/api/state?key={KA}')
-        ok(st['phase'] == 'settled', 'closing the last day settled the game')
+        ok(st['phase'] == 'trial' and st['trial']['of'] == 3,
+           'closing the last day opened an investigation')
+        code, d = req('POST', f'/r/{A}/api/accuse',
+                      {'token': toks['Cy'], 'target': 'Ana', 'dir': 'bear'})
+        ok(code == 200 and d['accusation'] == {'target': 'Ana', 'dir': 'bear'},
+           'an accusation files over HTTP')
+        code, d = req('POST', f'/r/{A}/api/accuse',
+                      {'token': toks['Cy'], 'target': 'Cy', 'dir': 'bear'})
+        ok(code == 400, 'accusing yourself is refused')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
+        ok(st['trial']['filed'] == 1 and 'Ana' not in json.dumps(st['trial']),
+           'the host sees how many are in, never who was named')
+        ok('accusation' not in json.dumps(st['players']),
+           "and no player row carries anyone's accusation")
+        code, _ = host(A, KA, 'resolve')
+        code, st = req('GET', f'/r/{A}/api/state?key={KA}')
+        ok(st['phase'] == 'settled', 'closing the investigation settled the game')
         stl = st['settlement']
         # the day-2 event draw may have been a value shock — score with the
         # game's CURRENT card values, exactly like the engine does

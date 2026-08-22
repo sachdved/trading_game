@@ -21,6 +21,15 @@ information" deck):
     a repeating interval while the day is open (host-set, default 60s), plus
     on demand by the host — public value/rule shocks, dividends and levies,
     and private forced orders (noise-trader flow).
+  * Investigations (optional): after a day closes, each player may privately
+    accuse one other of holding a big mover — a card worth -20 or worse ("bear")
+    or +20 or better ("bull"), which at the default values means an Ace or a
+    King. Get it right and the exposed trader pays an indemnity, split
+    among whoever read them correctly; get it wrong and you pay them a smaller
+    fee. Only the accuser learns their own verdict, so the market keeps its
+    information asymmetry — the trial sells information, it does not broadcast
+    it. Everything paid is a transfer between players, so the game stays
+    zero-sum. Who accused whom comes out at settlement.
   * Settlement: V = sum of points of ALL dealt cards; score = cash + pos * V.
   * Card points (hearts/spades): A=-40, K=+20, Q=J=0, others face value;
     diamonds/clubs = 0. Bids and asks must be strictly positive.
@@ -28,7 +37,7 @@ information" deck):
 
 import secrets
 
-GAME_VERSION = 4          # bump when the game dict shape changes (snapshots)
+GAME_VERSION = 7          # bump when the game dict shape changes (snapshots)
 
 RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
 SUITS = ['h', 's', 'd', 'c']
@@ -77,7 +86,7 @@ def round2(v):
 def create_game():
     return {
         'gameVersion': GAME_VERSION,
-        'phase': 'lobby',   # lobby | open | between (overnight) | settled
+        'phase': 'lobby',   # lobby | open | trial | between (overnight) | settled
         'day': 0,
         'settings': {
             'roles': 'assigned',      # assigned (MM vs taker) | everyone (all do both)
@@ -90,6 +99,10 @@ def create_game():
             'marginRate': 0,          # % per day charged on negative cash at day close
             'eventCards': False,      # deal event cards automatically during play
             'eventEverySeconds': 60,  # when eventCards on: 0 = only at day open, else interval
+            'trials': False,          # run an investigation after each day closes
+            'trialSeconds': 60,       # length of one investigation; 0 = host closes it
+            'indemnityRate': 0.5,     # exposed trader pays this x |card points|
+            'falseAccusationFee': 6,  # a wrong accuser pays this to the accused
             'anonymous': False,       # pseudonyms on book/tape/standings until settlement
             'cardValues': dict(DEFAULT_CARD_VALUES),   # host-manipulable A/K/Q/J points
         },
@@ -98,9 +111,9 @@ def create_game():
         'publicCards': [],
         'book': {'bids': [], 'asks': []},   # resting orders {pid, price, size, seq}
         'seq': 0,                     # arrival counter for price-time priority
-        'trades': [],                 # {i, buyer, seller, price, size, ts}
+        'trades': [],                 # {i, buyer, seller, price, size, ts, day}
         'events': [],                 # drawn event cards {i, day, ts, id, headline, detail}
-        'eventDeck': [],              # remaining event ids; refilled+shuffled when empty
+        'trials': [],                 # resolved investigations, revealed at settlement
         'feesCollected': 0,           # exchange take when feePerUnit > 0 (burned)
         'interestPaid': 0,            # margin interest collected at day closes (burned)
         'log': [],
@@ -187,7 +200,8 @@ def add_player(game, raw_name, now):
             raise GameError(f'The game is full — the host capped it at {cap} players.')
         raise GameError('The game is full for the current deck setting.')
     p = {'id': new_id(), 'name': name, 'role': _default_role(game),
-         'card': None, 'cash': 0, 'pos': 0, 'active': True, 'forced': None}
+         'card': None, 'cash': 0, 'pos': 0, 'active': True, 'forced': None,
+         'accusation': None, 'verdict': None}
     game['players'][p['id']] = p
     game['joinOrder'].append(p['id'])
     note(game, f'{name} joined', now)
@@ -260,6 +274,25 @@ def set_settings(game, patch, now):
             if not (0 <= v <= 10):
                 raise GameError('The fee must be between 0 and 10 per unit.')
             s['feePerUnit'] = v
+        if 'trials' in patch:      # live-tunable: master on/off for investigations
+            s['trials'] = bool(patch['trials'])
+        if 'trialSeconds' in patch:  # live-tunable: 0 = the host closes it by hand
+            v = _num(patch['trialSeconds'], 'investigation clock')
+            if v != int(v) or (v != 0 and not (15 <= v <= 600)):
+                raise GameError('The investigation clock must be 0 (host closes it) '
+                                'or 15-600 seconds.')
+            s['trialSeconds'] = int(v)
+        if 'indemnityRate' in patch:  # live-tunable: applies to the next verdict
+            v = round2(_num(patch['indemnityRate'], 'indemnity rate'))
+            if not (0 <= v <= 5):
+                raise GameError('The indemnity rate must be between 0 and 5 '
+                                'times the card value.')
+            s['indemnityRate'] = v
+        if 'falseAccusationFee' in patch:  # live-tunable: applies to the next verdict
+            v = round2(_num(patch['falseAccusationFee'], 'fee'))
+            if not (0 <= v <= 100):
+                raise GameError('The false-accusation fee must be between 0 and 100.')
+            s['falseAccusationFee'] = v
         if 'anonymous' in patch:   # live-tunable: display only, pseudonyms are stable
             s['anonymous'] = bool(patch['anonymous'])
         if 'cardValues' in patch:  # live-tunable on purpose: a mid-game "news shock"
@@ -386,12 +419,12 @@ def start_game(game, now, rng):
     game['seq'] = 0
     game['trades'] = []
     game['events'] = []
-    game['eventDeck'] = []
+    game['trials'] = []
     game['feesCollected'] = 0
     game['interestPaid'] = 0
     game['settlement'] = None
     for p in players:
-        p['forced'] = None
+        p['forced'] = p['accusation'] = p['verdict'] = None
     ds = game['settings']['daySeconds']
     game['deadline'] = now + ds * 1000 if ds > 0 else None
     game['eventDeadline'] = None
@@ -439,16 +472,19 @@ def _close_day(game, now):
 
 
 def end_day(game, now):
-    """Close the current day overnight; settling instead after the last day."""
+    """Close the current day: an investigation if they are on, then overnight —
+    or settlement, once the last day has been closed out."""
     if game['phase'] != 'open':
         raise GameError('No day is open right now.')
     _close_day(game, now)
+    note(game, f"Day {game['day']} closed — the book is wiped overnight, positions carry", now)
+    if game['settings'].get('trials') and open_trial(game, now):
+        return 'trial'
     if game['day'] >= game['settings']['days']:
         _settle(game, now)
         return 'settled'
     game['phase'] = 'between'
     game['deadline'] = None
-    note(game, f"Day {game['day']} closed — the book is wiped overnight, positions carry", now)
     return 'between'
 
 
@@ -495,6 +531,10 @@ def _tick_events(game, now, rng):
 
 
 
+NEWS_KEPT = 16        # events kept in a view: what the news scroller can replay
+EVENT_COOLDOWN = 4    # draws a card sits out after being dealt
+
+
 EVENT_CARDS = [
     {'id': 'ace-crash',   'headline': 'Rating downgrade — Aces fall 30 points'},
     {'id': 'king-rally',  'headline': 'Merger rumor — Kings gain 30 points'},
@@ -512,15 +552,62 @@ EVENT_CARDS = [
 ]
 
 
+def _clamp_points(v):
+    return max(-200, min(200, int(v)))
+
+
 def _eligible_forced(game):
     return [p for p in active_players(game) if can_take(p) and not p.get('forced')]
+
+
+def _event_applicable(game, eid, now):
+    """Would this card actually change something right now? A card that would
+    land as a no-op is held back, so every headline the news carries is true —
+    no 'fees drop to zero' when trading is already free."""
+    s = game['settings']
+    vals = s.get('cardValues') or DEFAULT_CARD_VALUES
+    fee = s.get('feePerUnit') or 0
+    if eid in ('forced-buy', 'forced-sell'):
+        return bool(_eligible_forced(game))
+    if eid == 'ace-crash':
+        return _clamp_points(vals['A'] - 30) != vals['A']
+    if eid == 'king-rally':
+        return _clamp_points(vals['K'] + 30) != vals['K']
+    if eid == 'royal-swap':
+        return vals['A'] != vals['K']
+    if eid == 'face-lift':
+        return (_clamp_points(vals['Q'] + 15) != vals['Q']
+                or _clamp_points(vals['J'] + 15) != vals['J'])
+    if eid == 'fee-hike':
+        return fee < 10
+    if eid == 'fee-holiday':
+        return fee > 0
+    if eid == 'dark-pool':
+        return not s.get('anonymous')
+    if eid == 'flash-close':
+        return game['deadline'] is None or game['deadline'] > now + 60_000
+    return True     # dividends, levies and audits always land somewhere
+
+
+def _event_pool(game, now):
+    """The cards that can be dealt right now, minus the last few dealt.
+
+    Drawing from this pool with replacement — rather than dealing a shuffled
+    deck down — is what keeps two sessions from walking the same card list: a
+    deck of 13 distinct cards guarantees you see almost all of them, in a
+    different order, every single game. The cooldown does the job the deck was
+    really there for, which is stopping the same headline twice in a row.
+    """
+    live = [c['id'] for c in EVENT_CARDS if _event_applicable(game, c['id'], now)]
+    recent = {e['id'] for e in game['events'][-EVENT_COOLDOWN:]}
+    return [i for i in live if i not in recent] or live
 
 
 def _apply_event(game, eid, now, rng):
     """Mutate the game per event card; returns the public detail line."""
     s = game['settings']
     vals = dict(s.get('cardValues') or DEFAULT_CARD_VALUES)
-    clamp = lambda v: max(-200, min(200, int(v)))
+    clamp = _clamp_points
     if eid == 'ace-crash':
         vals['A'] = clamp(vals['A'] - 30)
         s['cardValues'] = vals
@@ -578,22 +665,20 @@ def _apply_event(game, eid, now, rng):
     return ''
 
 
-def draw_event(game, now, rng):
-    """Draw the next applicable event card and apply it."""
+def draw_event(game, now, rng, eid=None):
+    """Deal an event card: a random applicable one, or `eid` to stage a chosen
+    shock (the classroom "and now the news" move)."""
     if game['phase'] != 'open':
         raise GameError('Event cards can only be drawn while the market is open.')
-    eid = None
-    for _ in range(len(EVENT_CARDS) + 1):
-        if not game['eventDeck']:
-            game['eventDeck'] = [e['id'] for e in EVENT_CARDS]
-            rng.shuffle(game['eventDeck'])
-        cand = game['eventDeck'].pop()
-        if cand in ('forced-buy', 'forced-sell') and not _eligible_forced(game):
-            continue   # nobody can receive an order right now; skip this card
-        eid = cand
-        break
     if eid is None:
-        raise GameError('No applicable event card right now.')
+        pool = _event_pool(game, now)
+        if not pool:
+            raise GameError('No applicable event card right now.')
+        eid = rng.choice(pool)
+    elif not any(c['id'] == eid for c in EVENT_CARDS):
+        raise GameError(f'No such event card: {eid}')
+    elif not _event_applicable(game, eid, now):
+        raise GameError('That card would not change anything right now.')
     detail = _apply_event(game, eid, now, rng)
     card = next(e for e in EVENT_CARDS if e['id'] == eid)
     game['events'].append({'i': len(game['events']), 'day': game['day'], 'ts': now,
@@ -633,7 +718,8 @@ def _apply_trade(game, buyer, seller, price, size, now):
     if fee:
         game['feesCollected'] = round2(game.get('feesCollected', 0) + 2 * fee * size)
     game['trades'].append({'i': len(game['trades']), 'buyer': buyer, 'seller': seller,
-                           'price': price, 'size': size, 'ts': now})
+                           'price': price, 'size': size, 'ts': now,
+                           'day': game['day']})
 
 
 def _match_incoming(game, pid, side, price, size, now):
@@ -736,11 +822,14 @@ def market_order(game, pid, side, size, now):
 
 
 def settle(game, now):
-    """Close the market now: run day-close mechanics if mid-day, then score."""
-    if game['phase'] not in ('open', 'between'):
+    """Close the market now: run day-close mechanics if mid-day, score any open
+    investigation (people committed to those accusations), then settle."""
+    if game['phase'] not in ('open', 'trial', 'between'):
         raise GameError('The market has not opened — nothing to settle.')
     if game['phase'] == 'open':
         _close_day(game, now)
+    if game['phase'] == 'trial' and resolve_trial(game, now) == 'settled':
+        return      # that was the last day, so resolving it settled the game
     _settle(game, now)
 
 
@@ -771,6 +860,8 @@ def _settle(game, now):
                           'groups': groups,
                           'feesCollected': game.get('feesCollected', 0),
                           'interestPaid': game.get('interestPaid', 0),
+                          'trials': game.get('trials', []),
+                          'indemnities': trials_moved(game),
                           'anonymous': bool(game['settings'].get('anonymous'))}
     game['phase'] = 'settled'
     game['deadline'] = None
@@ -786,18 +877,22 @@ def rematch(game, now):
     game['joinOrder'] = [pid for pid in game['joinOrder'] if game['players'][pid]['active']]
     game['players'] = {pid: game['players'][pid] for pid in game['joinOrder']}
     for p in game['players'].values():
-        p.update(card=None, cash=0, pos=0, informed=None, alias=None, forced=None)
+        p.update(card=None, cash=0, pos=0, informed=None, alias=None, forced=None,
+                 accusation=None, verdict=None)
     game.update(phase='lobby', day=0, publicCards=[], book={'bids': [], 'asks': []},
-                seq=0, trades=[], events=[], eventDeck=[], feesCollected=0,
+                seq=0, trades=[], events=[], trials=[], feesCollected=0,
                 interestPaid=0, settlement=None, deadline=None, eventDeadline=None)
     note(game, 'Rematch — back to the lobby with the same players', now)
 
 
 def on_deadline(game, now, rng):
-    """Called by the server when the earliest armed clock (day or event) fires."""
+    """Called by the server when the earliest armed clock fires (day, event or
+    investigation)."""
     if game['deadline'] is not None and now >= game['deadline']:
         if game['phase'] == 'open':
-            return 'settle' if end_day(game, now) == 'settled' else 'endDay'
+            return {'settled': 'settle', 'trial': 'trial'}.get(end_day(game, now), 'endDay')
+        if game['phase'] == 'trial':
+            return 'settle' if resolve_trial(game, now) == 'settled' else 'endTrial'
         game['deadline'] = None
         return 'clear'
     if (game['phase'] == 'open' and game.get('eventDeadline') is not None
@@ -807,7 +902,280 @@ def on_deadline(game, now, rng):
     return None
 
 
+# ---------------------------------------------------------------- investigations
+
+TRIAL_MIN_PLAYERS = 3    # below this, "guess who" has no room to be wrong
+MATERIAL_POINTS = 20     # |points| at which a card is a big mover, and accusable
+
+
+def display_name(game, p, anon):
+    """What a given audience calls this player: the alias hides identity on the
+    trading surfaces, so it is also what an accusation has to name."""
+    if not p:
+        return '—'
+    return (p.get('alias') or p['name']) if anon else p['name']
+
+
+def anon_for(game, kind):
+    return (bool(game['settings'].get('anonymous'))
+            and kind in ('player', 'board') and game['phase'] != 'lobby')
+
+
+def card_case(game, p):
+    """What this player could truthfully be accused of: 'bear', 'bull' or None.
+
+    Only the big movers count. Accusing on the *sign* of a card would be a
+    base-rate bet rather than a read — in a hearts-and-spades deal ten ranks of
+    thirteen are worth something positive, so "you're a bull" would be right most
+    of the time without looking at the tape. At the default values this picks out
+    exactly the Ace and the King, and it keeps tracking whatever the host (or an
+    event card) has moved those values to.
+    """
+    if not p.get('card'):
+        return None
+    pts = card_points(p['card'], game['settings'].get('cardValues'))
+    if pts <= -MATERIAL_POINTS:
+        return 'bear'
+    if pts >= MATERIAL_POINTS:
+        return 'bull'
+    return None
+
+
+def trial_candidates(game, pid, anon):
+    """Who this player may accuse, by the name they see them under."""
+    return sorted(display_name(game, p, anon) for p in active_players(game)
+                  if p['id'] != pid)
+
+
+def _resolve_label(game, label, anon):
+    want = ' '.join(str(label or '').split())
+    for p in active_players(game):
+        if display_name(game, p, anon) == want:
+            return p
+    raise GameError('No such trader in this room.')
+
+
+def open_trial(game, now):
+    """Start the investigation that follows a day close. Returns False (and
+    changes nothing) when there is no one to investigate."""
+    if len(active_players(game)) < TRIAL_MIN_PLAYERS:
+        return False
+    for p in game['players'].values():
+        p['accusation'] = p['verdict'] = None
+    game['phase'] = 'trial'
+    ts = game['settings'].get('trialSeconds') or 0
+    game['deadline'] = now + ts * 1000 if ts > 0 else None
+    game['eventDeadline'] = None
+    note(game, f"Investigation opened after day {game['day']}", now)
+    return True
+
+
+def file_accusation(game, pid, target, direction, now):
+    """Name one other trader as a bear or a bull — or pass `target=None` to
+    abstain. Private: nobody else's payload ever carries this."""
+    if game['phase'] != 'trial':
+        raise GameError('No investigation is open right now.')
+    p = game['players'].get(pid)
+    if not p or not p['active']:
+        raise GameError('You are not in this game.')
+    if target is None or target == '':
+        p['accusation'] = None
+        return {'accusation': None}
+    if direction not in ('bear', 'bull'):
+        raise GameError('Accuse them of being a bear or a bull.')
+    anon = bool(game['settings'].get('anonymous'))
+    t = _resolve_label(game, target, anon)
+    if t['id'] == pid:
+        raise GameError('You cannot accuse yourself.')
+    p['accusation'] = {'target': t['id'], 'dir': direction}
+    return {'accusation': {'target': display_name(game, t, anon), 'dir': direction}}
+
+
+def resolve_trial(game, now):
+    """Score the accusations, move the indemnities, and go overnight (or settle).
+
+    An exposed trader pays ONE indemnity however many people read them, split
+    among those who did. Charging each accuser in full would make being read a
+    bigger loss than trading on the card was ever worth, and the informed would
+    simply stop trading — which is the one thing this must not do.
+    """
+    if game['phase'] != 'trial':
+        raise GameError('No investigation is open right now.')
+    s = game['settings']
+    rate = s.get('indemnityRate') or 0
+    fee = round2(s.get('falseAccusationFee') or 0)
+    accusers = [p for p in active_players(game) if p.get('accusation')]
+
+    correct = {}    # exposed pid -> accusers who read them right
+    wrong = []      # (accuser, accused)
+    for a in accusers:
+        acc = a['accusation']
+        t = game['players'].get(acc['target'])
+        if not t:
+            continue
+        if card_case(game, t) == acc['dir']:
+            correct.setdefault(t['id'], []).append(a)
+        else:
+            wrong.append((a, t))
+
+    rows = []
+    for tid, winners in correct.items():
+        t = game['players'][tid]
+        pts = abs(card_points(t['card'], s.get('cardValues')))
+        due = round2(pts * rate)
+        t['cash'] = round2(t['cash'] - due)
+        share = round2(due / len(winners))
+        paid = 0
+        for i, a in enumerate(winners):
+            # the last share carries the rounding, so the transfer nets to zero
+            cut = round2(due - paid) if i == len(winners) - 1 else share
+            a['cash'] = round2(a['cash'] + cut)
+            paid = round2(paid + cut)
+            a['verdict'] = {'target': t['id'], 'dir': a['accusation']['dir'],
+                            'correct': True, 'amount': cut}
+            rows.append({'accuser': a['name'], 'target': t['name'],
+                         'dir': a['accusation']['dir'], 'correct': True, 'amount': cut})
+    for a, t in wrong:
+        a['cash'] = round2(a['cash'] - fee)
+        t['cash'] = round2(t['cash'] + fee)
+        a['verdict'] = {'target': t['id'], 'dir': a['accusation']['dir'],
+                        'correct': False, 'amount': -fee}
+        rows.append({'accuser': a['name'], 'target': t['name'],
+                     'dir': a['accusation']['dir'], 'correct': False, 'amount': -fee})
+
+    moved = round2(sum(abs(r['amount']) for r in rows))
+    game['trials'].append({'i': len(game['trials']), 'day': game['day'],
+                           'ts': now, 'filed': len(accusers), 'moved': moved,
+                           'exposed': len(correct), 'rows': rows})
+    for p in game['players'].values():
+        p['accusation'] = None
+    note(game, f'Investigation closed: {len(accusers)} accusation(s), '
+               f'{len(correct)} trader(s) exposed, {moved} moved', now)
+
+    if game['day'] >= game['settings']['days']:
+        _settle(game, now)
+        return 'settled'
+    game['phase'] = 'between'
+    game['deadline'] = None
+    return 'between'
+
+
+def trials_moved(game):
+    return round2(sum(t['moved'] for t in game['trials']))
+
+
+# ---------------------------------------------------------------- price chart
+
+CHART_TARGET = 40       # candles one full trading day aims for
+CHART_MAX = 72          # hard cap on candles shipped in a view
+CHART_LULL = 0.25       # empty room the open day keeps past its last print…
+CHART_LULL_MS = 10_000  # …but at least this much, so one lone print still breathes
+CHART_STEPS = [1_000, 2_000, 5_000, 10_000, 15_000, 30_000, 60_000, 120_000,
+               300_000, 600_000, 900_000, 1_800_000, 3_600_000]
+
+
+def _trading_spans(game, now):
+    """(day, first_ts, last_ts) for every day that printed a trade, oldest first.
+    The open day runs to `now`, so a live chart keeps advancing through a lull."""
+    seen = {}
+    for t in game['trades']:
+        d = t.get('day', 1)
+        lo, hi = seen.get(d, (t['ts'], t['ts']))
+        seen[d] = (min(lo, t['ts']), max(hi, t['ts']))
+    spans = []
+    for d in sorted(seen):
+        lo, hi = seen[d]
+        if d == game['day'] and game['phase'] == 'open':
+            # run on to `now` so a live chart shows the clock moving — but only
+            # so far: a market left open and idle for an hour must not squash the
+            # session's actual trading into a sliver at the left edge.
+            hi = min(max(hi, now), hi + max(CHART_LULL_MS, int((hi - lo) * CHART_LULL)))
+        spans.append((d, lo, hi))
+    return spans
+
+
+def _candle_ms(game, spans):
+    """Pick the candle interval: sized off the day clock when there is one (so
+    candles keep the same width all session), off the elapsed span when the host
+    closes days by hand — then widened until the series fits CHART_MAX."""
+    ds = game['settings'].get('daySeconds') or 0
+    want = (ds * 1000 / CHART_TARGET if ds > 0
+            else sum(hi - lo for _, lo, hi in spans) / CHART_TARGET)
+    for b in CHART_STEPS:
+        if b >= want and sum(hi // b - lo // b + 1 for _, lo, hi in spans) <= CHART_MAX:
+            return b
+    return CHART_STEPS[-1]
+
+
+def chart_series(game, now=0):
+    """Aggregate every trade so far into fixed-interval OHLC candles.
+
+    Trading days sit back to back on the x-axis — the overnight gap is dropped,
+    since nothing can trade then — and each candle carries its day so the client
+    can draw the boundary. Empty buckets *inside* a day are kept (as n=0) so a
+    lull in trading reads as a lull. Prices and sizes only: nothing in here says
+    who traded, so the series is safe in every audience's view.
+    """
+    if not game['trades']:
+        return {'bucketMs': 0, 'candles': [], 'trades': 0,
+                'lo': None, 'hi': None, 'last': None, 'vmax': 0}
+    spans = _trading_spans(game, now)
+    b = _candle_ms(game, spans)
+    buckets = {}
+    for t in game['trades']:
+        buckets.setdefault((t.get('day', 1), t['ts'] // b), []).append(t)
+    candles = []
+    for d, lo, hi in spans:
+        for k in range(lo // b, hi // b + 1):
+            ts = buckets.get((d, k))
+            if not ts:
+                candles.append({'day': d, 'n': 0})
+                continue
+            px = [t['price'] for t in ts]
+            candles.append({'day': d, 'o': px[0], 'h': max(px), 'l': min(px),
+                            'c': px[-1], 'v': sum(t['size'] for t in ts),
+                            'n': len(ts)})
+    candles = candles[-CHART_MAX:]
+    filled = [c for c in candles if c['n']]
+    return {
+        'bucketMs': b,
+        'candles': candles,
+        'trades': len(game['trades']),
+        'lo': min((c['l'] for c in filled), default=None),
+        'hi': max((c['h'] for c in filled), default=None),
+        'last': game['trades'][-1]['price'],
+        'vmax': max((c['v'] for c in filled), default=0),
+    }
+
+
 # ---------------------------------------------------------------- views
+
+def _trial_view(game):
+    """What every audience may know about an open investigation: how many
+    accusations are in, and nothing whatsoever about their contents."""
+    act = active_players(game)
+    return {'day': game['day'], 'of': len(act),
+            'filed': sum(1 for p in act if p.get('accusation'))}
+
+
+def _own_accusation(game, p, anon):
+    """A player's own filed accusation, named the way they filed it."""
+    acc = p.get('accusation')
+    if not acc:
+        return None
+    return {'target': display_name(game, game['players'].get(acc['target']), anon),
+            'dir': acc['dir']}
+
+
+def _own_verdict(game, p, anon):
+    """The private result of a player's own accusation — the information they
+    bought. It names the target exactly as they accused them, so a pseudonym
+    stays a pseudonym."""
+    v = p.get('verdict')
+    if not v:
+        return None
+    return dict(v, target=display_name(game, game['players'].get(v['target']), anon))
+
 
 def view_for(game, kind, pid=None, extras=None):
     """Build the JSON state tailored to one audience (never leaks private cards)."""
@@ -837,6 +1205,9 @@ def view_for(game, kind, pid=None, extras=None):
             entry['cash'] = p['cash']
         if kind == 'host' and p.get('alias'):
             entry['alias'] = p['alias']
+        if game['phase'] == 'trial':
+            # that someone has filed is public; what they filed is not
+            entry['filed'] = bool(p.get('accusation'))
         players.append(entry)
 
     standings = None
@@ -869,9 +1240,14 @@ def view_for(game, kind, pid=None, extras=None):
                   'buyer': disp(t['buyer']), 'seller': disp(t['seller']),
                   'price': t['price'], 'size': t['size']}
                  for t in game['trades'][-30:]],
+        'chart': chart_series(game, now),
+        'trial': _trial_view(game) if game['phase'] == 'trial' else None,
+        'materialPoints': MATERIAL_POINTS,   # the rule the client explains
+        # the news scroller replays these, so it carries a session's worth, not
+        # just the latest few. Card values in force always live in `settings`.
         'events': [{'i': e['i'], 'day': e['day'], 'headline': e['headline'],
                     'detail': e['detail']}
-                   for e in game['events'][-6:]],
+                   for e in game['events'][-NEWS_KEPT:]],
         'standings': standings,
         'settlement': game['settlement'],
     }
@@ -887,6 +1263,9 @@ def view_for(game, kind, pid=None, extras=None):
             'informed': p.get('informed'),
             'cash': p['cash'], 'pos': p['pos'], 'forced': p.get('forced'),
             'canQuote': can_quote(p), 'canTake': can_take(p),
+            'accusation': _own_accusation(game, p, anon),
+            'verdict': _own_verdict(game, p, anon),
+            'candidates': trial_candidates(game, pid, anon) if game['phase'] == 'trial' else None,
             'fills': [{'i': t['i'],
                        'side': 'bought' if t['buyer'] == pid else 'sold',
                        'price': t['price'], 'size': t['size'],

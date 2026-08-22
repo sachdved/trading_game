@@ -610,6 +610,7 @@ class Handler(BaseHTTPRequestHandler):
                 '/api/quote': self.h_quote,
                 '/api/cancel': self.h_cancel,
                 '/api/market': self.h_market,
+                '/api/accuse': self.h_accuse,
                 '/api/host': self.h_host,
             }.get(m.group(2) or '') if m else None
             if not handler:
@@ -720,6 +721,15 @@ class Handler(BaseHTTPRequestHandler):
             touched(room)
         self.reply(200, out)
 
+    def h_accuse(self, code, body):
+        with LOCK:
+            room = self.get_room(code)
+            pid = self.player_from(room, body)
+            result = E.file_accusation(room.game, pid, body.get('target'),
+                                       body.get('dir'), now_ms())
+            touched(room)
+        self.reply(200, {'ok': True, **result})
+
     def h_host(self, code, body):
         with LOCK:
             room = self.get_room(code)
@@ -739,10 +749,12 @@ class Handler(BaseHTTPRequestHandler):
                 E.next_day(game, now, RNG)
             elif action == 'event':
                 E.draw_event(game, now, RNG)
+            elif action == 'resolve':
+                E.resolve_trial(game, now)
             elif action == 'settle':
                 E.settle(game, now)
             elif action == 'extend':
-                if game['phase'] != 'open':
+                if game['phase'] not in ('open', 'trial'):
                     raise E.GameError('Nothing to extend right now.')
                 secs = max(5, min(300, int(body.get('seconds') or 30)))
                 game['deadline'] = (game['deadline'] or now) + secs * 1000

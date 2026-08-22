@@ -205,7 +205,9 @@ The separation of concerns is strict, which is what makes rule-hacking safe:
   never interprets rules. Every room is an independent game dict, so rule changes in
   `engine.py` apply to all rooms alike.
 - **`public/app.js`** — rendering only; it draws whatever state the server pushes.
-  You touch it only when a new rule needs a knob or a display.
+  You touch it only when a new rule needs a knob or a display. The price chart lives
+  here as one pure string builder (`chartHTML`) that emits inline SVG from the
+  pre-aggregated candles in `S.chart` — no canvas, no library, no chart state.
 - **`tests.py`** — run `python3 tests.py` after *every* rule change; the matching,
   conservation, and privacy tests are the safety net.
 
@@ -225,8 +227,10 @@ those plus the rules that are still one-line code edits:
 | Quote pulling (cancels) | **built in** — `engine.cancel_quotes()` + `/api/cancel` | forbid it to make quotes firm again |
 | Seats per room | **built in** — lobby setting `maxPlayers` (server-wide caps are env vars) | `engine.capacity()` |
 | Margin interest on borrowed cash | **built in** — setting `marginRate` (%/day), charged in `engine._charge_margin()` at day close | pay interest on positive cash too, or charge shorts |
-| Event cards | **built in** — settings `eventCards` + `eventEverySeconds` (day-open + interval deals; the clock lives in `eventDeadline`, armed by `_arm_event`, fired via `on_deadline`→`_tick_events`) + host `event` action | add/edit cards in `engine.EVENT_CARDS` + `_apply_event()`; forced-order flow in `_execute_forced()` |
+| Event cards | **built in** — settings `eventCards` + `eventEverySeconds` (day-open + interval deals; the clock lives in `eventDeadline`, armed by `_arm_event`, fired via `on_deadline`→`_tick_events`) + host `event` action | add/edit cards in `engine.EVENT_CARDS` + `_apply_event()`; forced-order flow in `_execute_forced()`. Which card comes next is `_event_pool()`: applicable cards (`_event_applicable()`, which keeps back anything that would land as a no-op) minus the last `EVENT_COOLDOWN` dealt, sampled with replacement — pass `draw_event(..., eid=...)` to stage a chosen card instead |
 | Who gets information | **built in** — host setting `informedCount` (see section 3) | |
+| Investigations (the social-deception layer) | **built in** — settings `trials` / `trialSeconds` / `indemnityRate` / `falseAccusationFee`; the phase is opened by `open_trial()` from `end_day()`, filled in by `file_accusation()`, scored by `resolve_trial()` | `MATERIAL_POINTS` for what counts as an accusable big mover; `card_case()` for how a card is classified. Two things to preserve: an exposed trader pays **one** indemnity however many people read them (charging each accuser in full makes being read cost more than the card was worth, and the informed stop trading), and every payment is a **transfer**, so the zero-sum test still holds |
+| What a verdict tells the room | `_own_verdict()` + `_trial_view()` in `engine.py` | only the accuser learns their own result, and only the count is public. Broadcasting verdicts would flatten the information asymmetry the market runs on — if you change this, expect later trading days to go dead |
 | What counts as a cross (`bid ≥ ask` vs. strict `>`) | `engine._match_incoming()` | the price-comparison `break` line |
 | Trade price (resting price vs. midpoint) | `engine._match_incoming()` | the `o['price']` passed to `_apply_trade` |
 | Priority / tie-breaking | `engine._rest()` | the two `sort(key=…)` lambdas (price, then arrival `seq`) |
@@ -236,6 +240,9 @@ those plus the rules that are still one-line code edits:
 | Book carried across days vs. wiped overnight | `engine.end_day()` | keep the book instead of clearing |
 | Number of public cards, deal pools | `engine.start_game()` | the dealing block |
 | Scoring formula | `engine.settle()` | `total = cash + pos*V` |
+| Price-chart candles (interval, how many, the overnight gap) | `engine.chart_series()` + `CHART_TARGET` / `CHART_MAX` / `CHART_STEPS` / `CHART_LULL` | the aggregation is view-only — it reads `trades` and invents no rules. Candle width comes off the day clock so it stays put all session; days are laid out back to back and the empty night is dropped |
+| How the chart looks (candles vs. line, colours, the V line) | `app.chartHTML()` + the `price chart` block in `style.css` | it re-renders from scratch on every push and redraws only when the markup changed |
+| News ticker (how much news it replays, how fast it crawls) | `engine.NEWS_KEPT` for how many headlines a view carries; `app.newsBarHTML()` + the `news scroller` block in `style.css` for the crawl | the two track halves must stay identical — the seamless loop is a `-50%` translate — and it is redrawn only when the news changed, or the animation would restart on every push |
 
 Classroom playbook with the built-in knobs: run a clean baseline game; rematch with a
 **fee** and watch spreads widen and prices oscillate (negative serial correlation — the
@@ -273,6 +280,12 @@ touch points in the code as the reference example. The same steps apply to any k
   deliberately add fees) — the tests enforce this.
 - **Privacy:** private cards must never appear in board/host views or in other
   players' payloads. `test_view_privacy` guards this; extend it when you add fields.
+  The same goes for a forced order — the news says one trader has a mandate and never
+  which — so anything you add near `forced` has to keep `test_forced_order_privacy`
+  passing; it walks every audience's whole payload looking for a live mandate.
+  Accusations and verdicts are the same shape of secret, guarded by
+  `test_trial_privacy`; note that under anonymity a verdict must name its target by
+  the alias the accuser filed against, or a correct read hands over a real name.
 - **Purity:** engine functions take `now` and `rng` as arguments — no `time.time()` or
   bare `random` inside `engine.py`, or tests stop being deterministic and snapshot
   resume breaks.

@@ -38,7 +38,7 @@ second room on the same laptop. The URLs:
 |---|---|
 | `http://<laptop-ip>:3000` | The **landing page** — create a room, or join one by code |
 | `http://<laptop-ip>:3000/r/KFQTR` | **Players**, on their phones (same wifi) |
-| `http://<laptop-ip>:3000/r/KFQTR/board` | **TV / projector** — public info only, big type |
+| `http://<laptop-ip>:3000/r/KFQTR/board` | **TV / projector** — public info only, big type: price chart, book, standings |
 | `http://<laptop-ip>:3000/r/KFQTR/host` | **The host.** The browser that created the room is let in automatically; from another device use the room's *Copy host link* button (it carries `?key=…`) |
 
 > **Wifi gotchas:** everyone must be on the *same* network, and guest/hotel/corporate
@@ -90,10 +90,40 @@ the days (automatic when the day clock is on). `+30s` and close-now buttons over
 - **Overnight:** when a day ends, outstanding forced orders execute against what's left
   of the book, all resting orders are canceled, and margin interest (if set) is charged
   on negative cash. Positions and cash carry into the next day's empty book.
+- **Investigations (optional):** after a day closes, every player privately names one
+  trader they think is holding a **big mover** — a card worth ±20 or more, which by
+  default means an Ace or a King — and says which way (**bear** or **bull**). Read it
+  right and that trader pays an indemnity (their card's points × a host-set rate, so 20
+  for an Ace by default), split between everyone who read them; read it wrong and you
+  pay them a small fee. Everything paid is a *transfer* between players, so the game
+  stays zero-sum.
+
+  The point is what stays hidden: **only the accuser is told how their own accusation
+  went.** Nobody else learns who was named, or who was right. So a good read buys you
+  private information about V for tomorrow instead of broadcasting it — which is the one
+  thing a public verdict would ruin, by flattening the asymmetry the market runs on.
+  Being obvious in the market gets expensive, which is exactly the stealth-trading
+  pressure real informed traders face. Who accused whom comes out at settlement.
+
+  Keep the indemnity *below* what trading on a card is worth (the default 0.5 × points
+  does that), or the informed simply stop trading and the market stops being informative.
 - **Event cards (optional):** public news dealt at each day open, then automatically on a
   repeating timer (default ~once a minute) and whenever the host draws one — value and
-  fee shocks, dividends and levies, flash closes — plus private forced orders that
-  inject noise-trader flow nobody can attribute.
+  fee shocks, dividends and levies, flash closes — plus **forced orders**: one trader is
+  privately told they must buy or sell before the close. The news says only that *some*
+  trader is under a mandate; who it is, and for how much, reaches nobody else's screen —
+  that trader sees it in their own ticker and banner, so the flow it creates is real but
+  unattributable. Cards are drawn from the ones that would actually change something,
+  and a card sits out a few draws after landing, so no two sessions get the same news.
+  Every headline dealt so far then crawls across a **news ticker** on every screen —
+  tap it for the whole list — so nobody has to remember what the news was while they
+  were busy trading.
+- **The price chart:** every view draws the trades so far as a live chart — candles
+  (open/high/low/close per interval, with a volume strip) or a line through the prints,
+  switchable per device. It marks the current best bid/ask, the last price, and the
+  overnight boundary between days; days sit side by side with the empty night dropped.
+  At settlement it draws **V** across the chart, so the whole table can see how far the
+  market was from the truth. The trade tape is still there underneath, as the detail.
 - **Settlement:** V = sum of the points of **all** dealt cards (public + every private
   card actually in play). Score = cash from filled orders + net position × V. Shorting
   and negative scores are allowed; the game is zero-sum, minus any exchange fees the
@@ -123,6 +153,10 @@ takers take — use "everyone" mode (good for small groups) to let all players d
 | Players dealt a card | everyone | set *k* to create **informed vs. uninformed** traders: k random players get a card, the rest get nothing (worth 0). The count is public; *who* is secret — even from the host. Settlement compares the groups' average scores. |
 | Exchange fee per unit | 0 | charged to **both** sides of every fill and kept by the exchange; flip it on between rounds and watch spreads widen |
 | Anonymous trading | off | book, tape and standings show stable pseudonyms (Trader 1, 2, …) until settlement; the host still sees real names |
+| Investigations | off | after each day closes, every player privately accuses one trader of holding a big mover (±20 points or more); only the accuser hears their own verdict |
+| Investigation clock | 60s | 0 = the host closes each investigation by hand |
+| Indemnity rate | 0.5 | an exposed trader pays this × their card's points, split between everyone who read them |
+| Wrong-accusation fee | 6 | what a wrong accuser pays the trader they named |
 | Card points (A/K/Q/J) | −40 / +20 / 0 / 0 | host-editable, even mid-game as a "news shock"; number cards stay face value |
 
 Fee, anonymity, margin rate, event cards, the day count/clock and card points are also
@@ -189,7 +223,7 @@ server.py                    multi-room HTTP + Server-Sent-Events server, timers
 engine.py                    game rules: dealing, matching, market orders, scoring
 public/                      the web client (landing / player / host / board views)
 public/practice.html         solo practice table — a self-contained tutorial (/practice)
-tests.py                     270 checks: matching, scoring, privacy, rooms, reaper,
+tests.py                     402 checks: matching, scoring, privacy, rooms, reaper,
                              rate limits, seat takeover, full-game HTTP run
 Start_Trading_Game.command   macOS double-click launcher
 start-trading-game.bat       Windows double-click launcher
