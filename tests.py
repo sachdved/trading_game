@@ -679,8 +679,8 @@ def test_event_randomization():
         seen.update(ids)
         sets.add(frozenset(ids))
     ok(repeats == 0, f'no card repeats inside its {E.EVENT_COOLDOWN}-draw cooldown (got {repeats})')
-    ok(seen == {c['id'] for c in E.EVENT_CARDS}, f'every card is reachable (missed {
-        {c["id"] for c in E.EVENT_CARDS} - seen})')
+    all_ids = {c['id'] for c in E.EVENT_CARDS}
+    ok(seen == all_ids, f'every card is reachable (missed {all_ids - seen})')
     ok(len(sets) > 100, f'sessions draw different cards, not one permutation ({len(sets)}/120)')
     ok(len(targets) == 4 and min(targets.values()) > sum(targets.values()) / 8,
        f'mandates spread over every eligible trader ({dict(targets)})')
