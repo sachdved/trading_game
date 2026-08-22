@@ -1332,7 +1332,11 @@ def test_integration():
         ok(st['events'] and st['events'][-1]['headline'], 'the event shows up in state')
         # investigations over HTTP: turn them on, close the last day into one,
         # file an accusation, and have the host close it
-        code, _ = host(A, KA, 'settings', settings={'trials': True, 'trialSeconds': 0})
+        # the day-2 card above is a real draw, and dark-pool would put everyone
+        # behind a pseudonym — which is what an accusation then has to name. Pin
+        # names on here; accusing by alias is covered in test_trial_privacy.
+        code, _ = host(A, KA, 'settings',
+                       settings={'trials': True, 'trialSeconds': 0, 'anonymous': False})
         ok(code == 200, 'investigations can be switched on mid-game')
         code, _ = host(A, KA, 'endDay')
         code, st = req('GET', f'/r/{A}/api/state?key={KA}')
