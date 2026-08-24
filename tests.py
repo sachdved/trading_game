@@ -987,6 +987,204 @@ def test_trial_rules_and_edges():
        'and no view carries a trial')
 
 
+# ================================================================ bot tests
+# The strategies in bot.py must behave like a real player: they may only ever
+# see a view_for()-shaped payload (no game object, no hidden state), they must
+# only emit legal orders, and identical (view, seed) inputs must give identical
+# decisions. bot is imported lazily so a bot bug can't take down the engine suite.
+
+def _legal_bot_action(act, view):
+    """True iff act is None or a well-formed order the engine would accept."""
+    if act is None:
+        return True
+    if not isinstance(act, tuple) or not act:
+        return False
+    kind = act[0]
+    if kind == 'quote':
+        if len(act) != 5:
+            return False
+        _, bid, ask, bs, as_ = act
+        return (ask > bid and bid > 0 and ask <= 999.99
+                and isinstance(bs, int) and 1 <= bs <= 99
+                and isinstance(as_, int) and 1 <= as_ <= 99)
+    if kind == 'cancel':
+        return len(act) == 1
+    if kind == 'market':
+        if len(act) != 3:
+            return False
+        _, side, size = act
+        return side in ('buy', 'sell') and isinstance(size, int) and 1 <= size <= 99
+    if kind == 'accuse':
+        if len(act) != 3:
+            return False
+        _, target, direction = act
+        if target is None:
+            return direction is None
+        return isinstance(target, str) and direction in (None, 'bull', 'bear')
+    return False
+
+
+def _exec_bot_action(g, pid, act, now):
+    try:
+        if act[0] == 'quote':
+            E.submit_quote(g, pid, {'bid': act[1], 'ask': act[2],
+                                    'bidSize': act[3], 'askSize': act[4]}, now)
+        elif act[0] == 'cancel':
+            E.cancel_quotes(g, pid, now)
+        elif act[0] == 'market':
+            E.market_order(g, pid, act[1], act[2], now)
+        elif act[0] == 'accuse':
+            E.file_accusation(g, pid, act[1], act[2], now)
+    except E.GameError:
+        pass
+
+
+def _bot_view_seq(g, pid, n, now, rng):
+    """Capture n consecutive player views (json round-tripped) as the clock runs."""
+    seq = []
+    tick = 500
+    limit = now + 30 * 1000
+    while g['phase'] in ('open', 'trial') and now < limit and len(seq) < n:
+        now += tick
+        dl = [d for d in (g.get('deadline'), g.get('eventDeadline')) if d is not None]
+        if dl and now >= min(dl):
+            try:
+                E.on_deadline(g, now, rng)
+            except E.GameError:
+                pass
+        if g['phase'] in ('open', 'trial'):
+            v = E.view_for(g, 'player', pid, {'now': now, 'connections': {}})
+            seq.append((json.loads(json.dumps(v)), now))
+    return seq
+
+
+def test_bot_quote_validity():
+    import bot as B
+    rng = random.Random(0)
+    size_fn = lambda: rng.choice([1, 3, 7, 50, 99])
+    bad, made = 0, 0
+    for m in (-500, -50, -5, -1, 0, 1, 5, 50, 500, 2000):
+        for fee in (0, 1, 5):
+            for lam in (0, 1, 4, 25):
+                q = B.make_quote(m, fee, lam, rng, size_fn)
+                if q is None:
+                    continue
+                made += 1
+                _, bid, ask, bs, as_ = q
+                if not (q[0] == 'quote' and ask > bid and bid > 0 and ask <= 999.99
+                        and isinstance(bs, int) and 1 <= bs <= 99
+                        and isinstance(as_, int) and 1 <= as_ <= 99):
+                    bad += 1
+    ok(bad == 0, 'every quote is two-sided, positive, ask<=999.99, sizes 1..99 (%d bad)' % bad)
+    ok(made > 50, 'make_quote actually produced quotes (%d)' % made)
+    q = B.make_quote(10, 0, 4, random.Random(1), lambda: 3)
+    ok(q is not None and q[0] == 'quote' and q[2] > q[1], 'spot: a normal m quotes with ask>bid')
+    qneg = B.make_quote(-100, 0, 4, random.Random(1), lambda: 3)
+    ok(qneg is None or qneg[1] > 0, 'spot: a very negative m still quotes positive or abstains')
+
+
+def test_bot_no_cheat():
+    """A strategy's decision is a pure function of the observable view + its own seed.
+
+    The view is json round-tripped before it reaches the strategy, so the strategy
+    literally cannot hold a reference to the game object or any hidden field. Two
+    fresh instances (same seed) fed independent deep copies of the same view
+    sequence must make identical decisions at every step — any dependence on
+    hidden/global state would make them diverge."""
+    import bot as B
+    g = E.create_game()
+    pids = [E.add_player(g, n, NOW)['id'] for n in ('A', 'B', 'C', 'D')]
+    E.set_settings(g, {'roles': 'everyone', 'feePerUnit': 1, 'trials': True,
+                       'informedCount': None, 'dealPool': 'hs', 'days': 1,
+                       'daySeconds': 30}, NOW)
+    rng = random.Random(11)
+    now = NOW
+    E.start_game(g, now, rng)
+    E.submit_quote(g, pids[1], {'bid': 5, 'ask': 9, 'bidSize': 3, 'askSize': 3}, now)
+    E.submit_quote(g, pids[2], {'bid': 6, 'ask': 11, 'bidSize': 2, 'askSize': 2}, now)
+    seq = _bot_view_seq(g, pids[0], 8, now, rng)
+    ok(len(seq) >= 3, 'captured a view sequence (%d views)' % len(seq))
+    for t in ('ev', 'bluff', 'mix', 'noise'):
+        s1 = B.make_strategy(t, 555)
+        s2 = B.make_strategy(t, 555)
+        for i, (view, ts) in enumerate(seq):
+            v1 = json.loads(json.dumps(view))   # independent deep copies
+            v2 = json.loads(json.dumps(view))
+            a1 = s1.on_state(v1, ts)
+            a2 = s2.on_state(v2, ts)
+            ok(a1 == a2, '%s step %d: same view + same seed must give the same action (%r vs %r)'
+               % (t, i, a1, a2))
+
+
+def test_bot_action_validity():
+    """Across many real games and settings, every order a strategy emits is legal."""
+    import bot as B
+    configs = [
+        {'roles': 'everyone', 'feePerUnit': 0, 'trials': True, 'anonymous': False,
+         'informedCount': None, 'dealPool': 'hs', 'days': 1, 'daySeconds': 30},
+        {'roles': 'assigned', 'feePerUnit': 2, 'trials': True, 'anonymous': True,
+         'informedCount': 2, 'dealPool': 'hs', 'days': 2, 'daySeconds': 30},
+        {'roles': 'everyone', 'feePerUnit': 1, 'trials': False, 'anonymous': False,
+         'informedCount': None, 'dealPool': 'full', 'days': 1, 'daySeconds': 30},
+    ]
+    total, illegal = 0, None
+    for ci, cfg in enumerate(configs):
+        if illegal is not None:
+            break
+        for seed in range(3):
+            g = E.create_game()
+            pids = [E.add_player(g, n, NOW)['id'] for n in ('A', 'B', 'C', 'D')]
+            strats = [B.make_strategy(t, seed * 100 + ci) for t in ('ev', 'bluff', 'mix', 'noise')]
+            E.set_settings(g, dict(cfg), NOW)
+            rng = random.Random(seed)
+            now = NOW
+            E.start_game(g, now, rng)
+            tick = 500
+            limit = now + cfg['days'] * cfg['daySeconds'] * 1000 + cfg['days'] * 90000 + 120000
+            trial_since = None
+            while g['phase'] != 'settled' and now < limit:
+                now += tick
+                if g['phase'] == 'trial' and g['deadline'] is None:
+                    if trial_since is None:
+                        trial_since = now
+                    elif now - trial_since > 10000:
+                        try:
+                            E.resolve_trial(g, now)
+                        except E.GameError:
+                            pass
+                        trial_since = None
+                else:
+                    trial_since = None
+                dl = [d for d in (g.get('deadline'), g.get('eventDeadline')) if d is not None]
+                if dl and now >= min(dl):
+                    try:
+                        E.on_deadline(g, now, rng)
+                    except E.GameError:
+                        pass
+                    if g['phase'] == 'between':
+                        try:
+                            E.next_day(g, now, rng)
+                        except E.GameError:
+                            pass
+                if g['phase'] in ('open', 'trial'):
+                    for pid, strat in zip(pids, strats):
+                        if g['phase'] == 'trial' or now >= getattr(strat, 'next_act', 0):
+                            view = json.loads(json.dumps(
+                                E.view_for(g, 'player', pid, {'now': now, 'connections': {}})))
+                            act = strat.on_state(view, now)
+                            if not _legal_bot_action(act, view):
+                                illegal = (ci, seed, g['phase'], act)
+                                break
+                            if act is not None:
+                                total += 1
+                                _exec_bot_action(g, pid, act, now)
+            if illegal is not None:
+                break
+    ok(illegal is None, 'every emitted order is legal (first illegal: %r)' % (illegal,))
+    ok(total > 20, 'strategies actually acted (%d orders across %d games)'
+       % (total, len(configs) * 3))
+
+
 UNIT_TESTS = [test_cards, test_lobby_and_roles, test_settings_days, test_deal,
               test_deal_full_pool, test_quote_validation, test_continuous_matching,
               test_market_orders, test_day_flow_and_settle,
@@ -994,7 +1192,8 @@ UNIT_TESTS = [test_cards, test_lobby_and_roles, test_settings_days, test_deal,
               test_informed_axis, test_fee_and_anonymous, test_card_values,
               test_player_cap, test_margin_interest, test_event_cards,
               test_event_randomization, test_forced_order_privacy, test_event_timer,
-              test_trial_flow_and_payoffs, test_trial_privacy, test_trial_rules_and_edges]
+              test_trial_flow_and_payoffs, test_trial_privacy, test_trial_rules_and_edges,
+              test_bot_quote_validity, test_bot_no_cheat, test_bot_action_validity]
 
 
 # ================================================================ multi-room units
