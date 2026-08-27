@@ -50,6 +50,8 @@ second room on the same laptop. The URLs:
 
 1. Create a room, open its host panel, and put the room's board view on the projector.
 2. In the lobby, pick settings (defaults are sensible) and flip anyone's role if you like.
+   Short-handed? Add **AI players** in the settings panel — each joins as an ordinary
+   seat (you can kick them like any player).
 3. **Deal cards & open the market.** Everyone sees the 3 public cards; each player sees
    their own private card on their phone.
 4. **Trading is live and continuous** (default: one 5-minute day). Market makers post —
@@ -158,11 +160,12 @@ takers take — use "everyone" mode (good for small groups) to let all players d
 | Indemnity rate | 0.5 | an exposed trader pays this × their card's points, split between everyone who read them |
 | Wrong-accusation fee | 6 | what a wrong accuser pays the trader they named |
 | Card points (A/K/Q/J) | −40 / +20 / 0 / 0 | host-editable, even mid-game as a "news shock"; number cards stay face value |
+| AI players | none | the host adds AI seats from the lobby — each is a `bot.py` strategy (ev / bluff / mix / noise) playing as an ordinary seat, so it can be kicked, accused and settled like anyone. Lobby only; see [AI_PLAYERS.md](AI_PLAYERS.md) |
 
 Fee, anonymity, margin rate, event cards, the day count/clock and card points are also
 editable **mid-game** from the host panel ("Live rule tweaks"). Roles, deck, player cap,
-and the informed count are fixed once cards are dealt. Active non-default rules always
-show in the settings line that players and the board see.
+the informed count and the AI seats are fixed once cards are dealt. Active non-default
+rules always show in the settings line that players and the board see.
 
 ## Practical notes
 
@@ -219,12 +222,16 @@ python3 tests.py    # engine unit tests + a full game driven over HTTP
 
 ```
 server.py                    multi-room HTTP + Server-Sent-Events server, timers,
-                             room registry, rate limits, per-room persistence
+                              room registry, rate limits, per-room persistence
 engine.py                    game rules: dealing, matching, market orders, scoring
+bot.py                       the AI players: 4 strategies that play a room through the
+                              public API (standalone CLI, or spawned in-process by the
+                              server when the host adds AI seats from the lobby)
+bot_sim.py                   offline evaluation harness for the bot strategies
 public/                      the web client (landing / player / host / board views)
 public/practice.html         solo practice table — a self-contained tutorial (/practice)
-tests.py                     402 checks: matching, scoring, privacy, rooms, reaper,
-                             rate limits, seat takeover, full-game HTTP run
+tests.py                     475 checks: matching, scoring, privacy, rooms, reaper,
+                              rate limits, seat takeover, full-game HTTP run, AI players
 Start_Trading_Game.command   macOS double-click launcher
 start-trading-game.bat       Windows double-click launcher
 Dockerfile                   optional, for container hosting (see MULTIROOM.md)

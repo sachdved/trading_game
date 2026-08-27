@@ -89,7 +89,7 @@ The app containerizes in five lines — no dependencies to install:
 # Dockerfile
 FROM python:3.13-slim
 WORKDIR /app
-COPY server.py engine.py ./
+COPY server.py engine.py bot.py ./
 COPY public ./public
 CMD ["python3", "server.py"]
 ```
@@ -203,7 +203,14 @@ The separation of concerns is strict, which is what makes rule-hacking safe:
 - **`server.py`** — transport only: HTTP, SSE fan-out, the room registry, phase
   timers, snapshots, auth, rate limits. It calls engine functions under a lock and
   never interprets rules. Every room is an independent game dict, so rule changes in
-  `engine.py` apply to all rooms alike.
+  `engine.py` apply to all rooms alike. It also hosts the **AI players**: when the
+  host saves the lobby's AI seat list, `sync_bots()` runs one `bot.Client` per seat
+  in a daemon thread against the room's own loopback URL — ordinary seats, nothing
+  privileged — and keeps them alive across kicks, rematches, resets and restarts.
+- **`bot.py`** — the AI opponents: four strategies (ev / bluff / mix / noise) plus a
+  thin HTTP client (`bot.Client`) that plays a room through the public API. Same
+  file powers the standalone CLI (`python3 bot.py --url … --code … --type …`) and
+  the in-process seats the server spawns.
 - **`public/app.js`** — rendering only; it draws whatever state the server pushes.
   You touch it only when a new rule needs a knob or a display. The price chart lives
   here as one pure string builder (`chartHTML`) that emits inline SVG from the

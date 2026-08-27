@@ -1250,6 +1250,7 @@ def view_for(game, kind, pid=None, extras=None):
                    for e in game['events'][-NEWS_KEPT:]],
         'standings': standings,
         'settlement': game['settlement'],
+        'bots': ex.get('bots') or [],   # the host's AI seat spec (editor state)
     }
 
     if kind == 'player':

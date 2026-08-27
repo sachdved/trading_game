@@ -1185,6 +1185,23 @@ def test_bot_action_validity():
        % (total, len(configs) * 3))
 
 
+def test_bot_spec_sanitize():
+    import server as SRV
+    spec = SRV.sanitize_bot_spec([
+        {'name': '  EV  Bot  ', 'type': 'ev'},
+        {'name': 'ev bot', 'type': 'noise'},    # case-insensitive duplicate
+        {'name': 'Bluffer', 'type': 'bogus'},   # unknown type is dropped
+        {'name': '   ', 'type': 'ev'},          # blank name is dropped
+        'nonsense',                              # non-dict rows are dropped
+        {'name': 'Mixer', 'type': 'mix'},
+    ])
+    ok([b['name'] for b in spec] == ['EV Bot', 'ev bot 2', 'Mixer'],
+       'names trim, dedupe with a suffix, invalid rows drop')
+    ok([b['type'] for b in spec] == ['ev', 'noise', 'mix'], 'types survive sanitizing')
+    big = SRV.sanitize_bot_spec([{'name': f'B{i}', 'type': 'ev'} for i in range(50)])
+    ok(len(big) == SRV.MAX_BOTS_PER_ROOM, 'the AI seat count is capped')
+
+
 UNIT_TESTS = [test_cards, test_lobby_and_roles, test_settings_days, test_deal,
               test_deal_full_pool, test_quote_validation, test_continuous_matching,
               test_market_orders, test_day_flow_and_settle,
@@ -1193,7 +1210,8 @@ UNIT_TESTS = [test_cards, test_lobby_and_roles, test_settings_days, test_deal,
               test_player_cap, test_margin_interest, test_event_cards,
               test_event_randomization, test_forced_order_privacy, test_event_timer,
               test_trial_flow_and_payoffs, test_trial_privacy, test_trial_rules_and_edges,
-              test_bot_quote_validity, test_bot_no_cheat, test_bot_action_validity]
+              test_bot_quote_validity, test_bot_no_cheat, test_bot_action_validity,
+              test_bot_spec_sanitize]
 
 
 # ================================================================ multi-room units
@@ -1703,12 +1721,209 @@ def test_caps_http():
             proc.kill()
 
 
+def test_ai_players():
+    """AI players: the host configures seats from the lobby settings and the server
+    runs bot.py clients in-process. They must behave as ordinary players end to end:
+    join, play, lose their seat to a kick, a server restart mid-game, a rematch,
+    a reset, and a human's claim on a bot-spec name."""
+    global BASE
+    state_dir = tempfile.mkdtemp()
+    proc, port = spawn_server(state_dir)
+    BASE = f'http://127.0.0.1:{port}'
+    try:
+        code, r1 = req('POST', '/api/rooms', {})
+        ok(code == 200, 'room created')
+        A, KA = r1['code'], r1['hostKey']
+
+        def host(action, **kw):
+            return req('POST', f'/r/{A}/api/host', {'key': KA, 'action': action, **kw})
+
+        def st():
+            c, d = req('GET', f'/r/{A}/api/state?key={KA}')
+            assert c == 200, d
+            return d
+
+        def active_names():
+            return {p['name'] for p in st()['players'] if p['active']}
+
+        def wait_names(want, timeout=15.0):
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                have = active_names()
+                if want <= have:
+                    return have
+                time.sleep(0.2)
+            return active_names()
+
+        ok(st()['bots'] == [], 'no AI seats by default')
+
+        # configure two AI seats with the lobby settings (a blank name is dropped)
+        code, _ = host('settings',
+                       settings={'roles': 'everyone', 'daySeconds': 0},
+                       bots=[{'name': 'EV Bot', 'type': 'ev'},
+                             {'name': 'Bluffer', 'type': 'bluff'},
+                             {'name': '   ', 'type': 'noise'}])
+        ok(code == 200, 'AI seats save with the lobby settings')
+        ok([(b['name'], b['type']) for b in st()['bots']] ==
+           [('EV Bot', 'ev'), ('Bluffer', 'bluff')],
+           'the spec is normalized and shipped in the host view')
+
+        have = wait_names({'EV Bot', 'Bluffer'})
+        ok({'EV Bot', 'Bluffer'} <= have, f'both bots join as ordinary seats (have {have})')
+
+        # re-saving an unchanged spec is a no-op: no seat churn
+        ev_pid = next(p['id'] for p in st()['players'] if p['name'] == 'EV Bot')
+        code, _ = host('settings', settings={},
+                       bots=[{'name': 'EV Bot', 'type': 'ev'},
+                             {'name': 'Bluffer', 'type': 'bluff'}])
+        ok(code == 200, 're-saving an unchanged AI list is accepted')
+        ok(next(p['id'] for p in st()['players'] if p['name'] == 'EV Bot') == ev_pid,
+           'a re-save does not replace a running bot seat')
+
+        # a duplicate name dedupes; a removed bot's seat is pulled from the lobby
+        code, _ = host('settings', settings={},
+                       bots=[{'name': 'EV Bot', 'type': 'ev'},
+                             {'name': 'ev bot', 'type': 'noise'}])
+        ok(code == 200, 'a spec with a duplicate name is accepted')
+        ok([b['name'] for b in st()['bots']] == ['EV Bot', 'ev bot 2'],
+           'duplicate AI names are deduped with a suffix')
+        have = wait_names({'EV Bot', 'ev bot 2'})
+        ok('ev bot 2' in have and 'Bluffer' not in have,
+           'removed AI seats leave the lobby, added ones join')
+
+        # a human takes a bot-spec name: the AI must skip it, never claim it
+        code, _ = host('settings', settings={},
+                       bots=[{'name': 'EV Bot', 'type': 'ev'},
+                             {'name': 'ev bot 2', 'type': 'noise'},
+                             {'name': 'Ghost', 'type': 'noise'}])
+        have = wait_names({'Ghost'})
+        ok('Ghost' in have, 'the new AI seat joins')
+        ghost_pid = next(p['id'] for p in st()['players'] if p['name'] == 'Ghost')
+        code, _ = host('kick', pid=ghost_pid)
+        ok(code == 200, 'kicking the bot works')
+        ok(all(b['name'] != 'Ghost' for b in st()['bots']),
+           'kicking an AI seat drops it from the AI list')
+        code, d = req('POST', f'/r/{A}/api/join', {'name': 'Ghost'})
+        ok(code == 200 and d['pid'] != ghost_pid, 'a human can take the freed name')
+        human_ghost = d['pid']
+        code, _ = host('settings', settings={},
+                       bots=[{'name': 'EV Bot', 'type': 'ev'},
+                             {'name': 'ev bot 2', 'type': 'noise'},
+                             {'name': 'Ghost', 'type': 'noise'}])
+        ok(code == 200, 're-adding the name a human holds is accepted')
+        time.sleep(2.5)   # give any (incorrect) respawn attempt a chance to claim
+        s = st()
+        ok(next(p['id'] for p in s['players'] if p['name'] == 'Ghost') == human_ghost,
+           'the human keeps the seat — the AI skipped it instead of claiming')
+        ok(any(b['name'] == 'Ghost' for b in s['bots']),
+           'the spec keeps the row so the host sees the mismatch')
+        ok(any('could not join' in l['msg'] for l in s['log']),
+            'the host is told the AI seat could not join')
+
+        # the board view (projector) carries the AI list too, so the room can
+        # tell which seats are machines
+        buf = sse_snoop(port, f'/r/{A}/events?role=board', b'"bots"')
+        ok(b'"EV Bot"' in buf and b'"ev bot 2"' in buf,
+           'the board stream carries the AI seat list')
+
+        # the game: 3 AI seats + 1 human. Bots cannot be changed once it starts.
+        code, d = req('POST', f'/r/{A}/api/join', {'name': 'Human'})
+        ok(code == 200, 'the human joins')
+        code, _ = host('start')
+        ok(code == 200, 'the market opens with the bots in the room')
+        s = st()
+        ok(s['phase'] == 'open' and len([p for p in s['players'] if p['active']]) == 4,
+           'all four seats are in the game')
+        code, d = host('settings', settings={}, bots=[])
+        ok(code == 400 and 'lobby' in d['error'], 'AI seats are lobby-only')
+
+        # the bots actually trade: within a few seconds someone must have quoted
+        deadline = time.time() + 20
+        while time.time() < deadline and not (st()['book']['bids'] or st()['book']['asks']
+                                              or st()['tape']):
+            time.sleep(0.3)
+        s = st()
+        ok(s['book']['bids'] or s['book']['asks'] or s['tape'],
+           'the AI players post quotes / trade once the market is open')
+
+        # kick a bot mid-game: its seat goes inactive and leaves the AI list
+        ev_pid = next(p['id'] for p in s['players'] if p['name'] == 'EV Bot')
+        code, _ = host('kick', pid=ev_pid)
+        ok(code == 200, 'kicking a bot mid-game works')
+        s = st()
+        ok(not next(p for p in s['players'] if p['name'] == 'EV Bot')['active'],
+           'the kicked bot stops trading')
+        ok(all(b['name'] != 'EV Bot' for b in s['bots']), 'and it is off the AI list')
+
+        # a server restart mid-game: the surviving AI seat must re-claim its own
+        # seat (same pid, reconnected) and the human-named "Ghost" stays human
+        ev2_pid = next(p['id'] for p in s['players'] if p['name'] == 'ev bot 2')
+        ghost_pid = next(p['id'] for p in s['players'] if p['name'] == 'Ghost')
+        room_file = os.path.join(state_dir, A + '.json')
+        save_deadline = time.time() + 5
+        while time.time() < save_deadline:
+            try:
+                with open(room_file, encoding='utf-8') as f:
+                    snap = json.load(f)
+                if snap['game']['phase'] == 'open' and \
+                        snap.get('botPids', {}).get('ev bot 2') == ev2_pid:
+                    break
+            except (OSError, ValueError, KeyError):
+                pass
+            time.sleep(0.1)
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        proc, port = spawn_server(state_dir, fresh=False)
+        BASE = f'http://127.0.0.1:{port}'
+        have = wait_names({'ev bot 2', 'Ghost', 'Human'})
+        ok(have >= {'ev bot 2', 'Ghost', 'Human'}, 'everyone is still in the room after the restart')
+        ok(st()['phase'] == 'open', 'the market is still open after the restart')
+        conn_deadline = time.time() + 20
+        while time.time() < conn_deadline:
+            s = st()
+            if next(p for p in s['players'] if p['name'] == 'ev bot 2')['connected']:
+                break
+            time.sleep(0.3)
+        s = st()
+        ev2 = next(p for p in s['players'] if p['name'] == 'ev bot 2')
+        ok(ev2['connected'] and ev2['id'] == ev2_pid,
+           'the AI seat re-claimed its own seat and reconnected after the restart')
+        ok(next(p for p in s['players'] if p['name'] == 'Ghost')['id'] == ghost_pid,
+           '…and the human-named "Ghost" seat stayed human')
+        ok({b['name'] for b in s['bots']} == {'ev bot 2', 'Ghost'},
+           'the AI list survived the restart')
+
+        # settle, then rematch: the surviving AI seat reclaims its own seat
+        code, _ = host('settle')
+        ok(st()['phase'] == 'settled', 'the game settles with the bots playing in it')
+        code, _ = host('rematch')
+        have = wait_names({'ev bot 2', 'Ghost'})
+        ok('ev bot 2' in have, 'after a rematch the surviving AI seat is back in the lobby')
+        ok(next(p['id'] for p in st()['players'] if p['name'] == 'Ghost') == human_ghost,
+           '…but the human-named "Ghost" seat stays human')
+
+        # reset: the AI list survives and every bot re-joins the fresh lobby
+        code, _ = host('reset')
+        have = wait_names({'ev bot 2', 'Ghost'})
+        ok(have >= {'ev bot 2', 'Ghost'}, 'after a reset the AI seats re-join the fresh lobby')
+        ok(st()['phase'] == 'lobby', 'the room is back in the lobby')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 # ================================================================ runner
 
 def main():
     failures = 0
     for t in UNIT_TESTS + [test_rooms_and_reaper, test_integration,
-                           test_rate_limit_http, test_caps_http]:
+                           test_rate_limit_http, test_caps_http, test_ai_players]:
         try:
             t()
             print(f'  ✓ {t.__name__}')

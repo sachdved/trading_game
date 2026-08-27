@@ -329,12 +329,14 @@ function settingsLine(S) {
     ` · indemnity ×${fmt(s.indemnityRate)}, wrong costs ${fmt(s.falseAccusationFee)}`);
   if (s.maxPlayers) parts.push(`Max ${s.maxPlayers} players`);
   if (s.anonymous) parts.push('Anonymous trading');
+  if ((S.bots || []).length) parts.push(`AI players: ${S.bots.length}`);
   return parts.join(' · ');
 }
 
 function rosterChipsHTML(S) {
+  const botNames = new Set((S.bots || []).map(b => b.name));
   return S.players.filter(p => p.active).map(p =>
-    `<span class="chip ${p.filed ? 'done' : ''}"><span class="dot ${p.connected ? 'on' : ''}"></span>${esc(p.name)}` +
+    `<span class="chip ${p.filed ? 'done' : ''}"><span class="dot ${p.connected ? 'on' : ''}"></span>${botNames.has(p.name) ? '🤖 ' : ''}${esc(p.name)}` +
     (S.settings.roles === 'assigned' ? ` · ${roleShort(p.role)}` : '') +
     (p.filed ? ' ✓' : '') + `</span>`).join(' ');
 }
@@ -342,6 +344,7 @@ function rosterChipsHTML(S) {
 function hostRosterHTML(S) {
   const assigned = S.settings.roles === 'assigned';
   const inLobby = S.phase === 'lobby';
+  const botNames = new Set((S.bots || []).map(b => b.name));
   const rows = S.players.map(p => {
     if (!p.active) return `<tr class="muted"><td colspan="4">${esc(p.name)} (removed)</td></tr>`;
     const roleCell = inLobby && assigned
@@ -351,7 +354,7 @@ function hostRosterHTML(S) {
     const aka = S.settings.anonymous && p.alias
       ? ` <span class="small muted">= ${esc(p.alias)}</span>` : '';
     return `<tr>
-      <td><span class="dot ${p.connected ? 'on' : ''}"></span>${esc(p.name)}${aka}${
+      <td><span class="dot ${p.connected ? 'on' : ''}"></span>${botNames.has(p.name) ? '🤖 ' : ''}${esc(p.name)}${aka}${
         p.filed ? ' <span class="small" style="color:var(--pos)">✓ filed</span>' : ''}</td>
       <td>${roleCell}</td>
       <td class="r"><span class="num">${signed(p.pos)}</span> / ${moneyHTML(p.cash)}</td>
@@ -1080,6 +1083,40 @@ function cardValueFields(s) {
     </div>`;
 }
 
+/* AI players: custom seat list — name + strategy per row, saved with the lobby
+   settings. The server runs each one as an ordinary player (see bot.py). */
+const BOT_TYPES = [
+  ['ev', 'ev — honest EV quoter'],
+  ['bluff', 'bluff — heavy bluffer'],
+  ['mix', 'mix — EV with noise'],
+  ['noise', 'noise — feigns uninformed'],
+];
+const BOT_DEFAULT_NAMES = { ev: 'EV Bot', bluff: 'Bluffer', mix: 'Mixer', noise: 'Noise Bot' };
+
+function botRowHTML(name = '', type = 'ev') {
+  return `<div class="formrow botrow">
+    <div class="field"><label>Seat name</label>
+      <input type="text" class="botname" maxlength="20" value="${esc(name)}"
+             placeholder="${BOT_DEFAULT_NAMES[type] || 'EV Bot'}"></div>
+    <div class="field"><label>Strategy</label>
+      <select class="bottype">${BOT_TYPES.map(([t, label]) =>
+        `<option value="${t}" ${t === type ? 'selected' : ''}>${label}</option>`).join('')}</select></div>
+    <button class="btn mini danger" type="button" data-action="bot-del"
+            title="Remove this AI seat">✕</button>
+  </div>`;
+}
+
+function botEditorHTML(bots) {
+  const rows = (bots || []).map(b => botRowHTML(b.name, b.type)).join('');
+  return `<div class="field"><label>AI players — join as ordinary seats when you save</label>
+    <div id="botrows">${rows}</div>
+    <button class="btn mini" type="button" data-action="bot-add">＋ Add AI player</button>
+    <p class="small muted">Each AI seat is driven by a strategy from <code>bot.py</code> and plays
+    through the same public API as your phones: it can be kicked, accused, and settles like
+    anyone else. Seat order sets the role in assigned mode; kicking an AI seat removes it
+    for good.</p></div>`;
+}
+
 function liveTweaksForm(S) {
   const s = S.settings;
   return `<form class="panel" id="settingsform">
@@ -1173,6 +1210,7 @@ function buildHost(S) {
             <option value="hs" ${s.dealPool === 'hs' ? 'selected' : ''}>Hearts &amp; spades only (≤23 players)</option>
             <option value="full" ${s.dealPool === 'full' ? 'selected' : ''}>Full deck — clubs/diamonds worth 0 (≤49)</option>
           </select></div>
+        ${botEditorHTML(S.bots)}
         <div class="formrow">
           <div class="field"><label>Trading days</label>
             <input type="number" id="set-days" value="${s.days}" min="1" max="10" step="1"></div>
@@ -1394,7 +1432,18 @@ document.addEventListener('submit', async e => {
       if ($('set-falsefee')) st.falseAccusationFee = +$('set-falsefee').value;
       if ($('set-cv-A')) st.cardValues = Object.fromEntries(
         ['A', 'K', 'Q', 'J'].map(r => [r, +$('set-cv-' + r).value]));
-      await api(R('/api/host'), { key: hostKey, action: 'settings', settings: st });
+      let bots = null;
+      if ($('botrows')) {
+        // rows with a blank seat name get the default name of their strategy
+        bots = [...$('botrows').querySelectorAll('.botrow')].map(r => {
+          const type = r.querySelector('.bottype').value;
+          const name = r.querySelector('.botname').value.trim() || BOT_DEFAULT_NAMES[type];
+          return { name, type };
+        });
+      }
+      const payload = { key: hostKey, action: 'settings', settings: st };
+      if (bots) payload.bots = bots;
+      await api(R('/api/host'), payload);
       toast('Settings saved ✓');
     } else if (f.id === 'accuseform') {
       const who = f.querySelector('input[name=acc-who]:checked');
@@ -1454,6 +1503,13 @@ document.addEventListener('click', async e => {
       const body = { key: hostKey, action: el.dataset.cmd };
       if (el.dataset.cmd === 'extend') body.seconds = 30;
       await api(R('/api/host'), body);
+    } else if (a === 'bot-add') {
+      const box = $('botrows');
+      if (!box) return;
+      box.insertAdjacentHTML('beforeend', botRowHTML());
+      box.lastElementChild.querySelector('.botname').focus();
+    } else if (a === 'bot-del') {
+      el.closest('.botrow')?.remove();
     } else if (a === 'host-role') {
       await api(R('/api/host'), { key: hostKey, action: 'role', pid: el.dataset.pid, role: el.dataset.role });
     } else if (a === 'host-kick') {

@@ -38,6 +38,7 @@ import urllib.parse
 from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import bot as B
 import engine as E
 
 VERSION = '2.0.0'
@@ -73,7 +74,15 @@ RNG = random.Random()
 ROOMS = {}           # code -> Room
 BUCKETS = {}         # (kind, ip) -> deque of request timestamps
 BASE_URL = None      # public base URL, filled in once we know the port
+LOCAL_URL = None     # loopback base URL; in-process AI players talk to the room through it
 STARTED = time.time()
+
+# AI players (host-configured from the lobby): each is an ordinary seat driven by a
+# bot.py client running in a daemon thread in this process, talking to the room over
+# the same public HTTP API a phone would use. No privileged access, no engine changes.
+BOT_TYPES = ('ev', 'bluff', 'mix', 'noise')
+MAX_BOTS_PER_ROOM = 16
+BOT_JOIN_TIMEOUT_S = 20
 
 CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ'   # no I/L/O — phone-typeable
 CODE_LEN = 5
@@ -111,6 +120,9 @@ class Room:
         self.save_timer = None    # debounced snapshot timer
         self.created = now_ms()
         self.last_active = now_ms()
+        self.bots = []            # host's AI seat spec: [{'name': …, 'type': …}]
+        self.bot_clients = {}     # spec name -> running bot.Client (daemon thread)
+        self.bot_pids = {}        # spec name -> pid of the seat we spawned (theirs to reclaim)
 
     def alive(self):
         return ROOMS.get(self.code) is self
@@ -179,6 +191,8 @@ def reap_rooms(now):
                 room.timer.cancel()
             if room.save_timer:
                 room.save_timer.cancel()
+            for name in list(room.bot_clients):
+                stop_bot(room, name)
             del ROOMS[room.code]
             delete_room_file(room.code)
             removed.append(room.code)
@@ -198,6 +212,109 @@ def reaper_loop():
             reap_rooms(now_ms())
         except Exception as e:   # never let the reaper thread die
             print(f'[gm] reaper error: {e!r}', flush=True)
+
+
+# ---------------------------------------------------------------- AI players
+
+def sanitize_bot_spec(spec):
+    """Normalize the host's AI seat list: trim/collapse names, drop unknown types
+    and empty names, dedupe case-insensitively with a numeric suffix, cap the count."""
+    out, seen = [], set()
+    for row in spec or []:
+        if not isinstance(row, dict):
+            continue
+        name = ' '.join(str(row.get('name') or '').split())[:E.MAX_NAME]
+        kind = str(row.get('type') or '')
+        if not name or kind not in BOT_TYPES or len(out) >= MAX_BOTS_PER_ROOM:
+            continue
+        if name.lower() in seen:
+            i = 2
+            while f'{name} {i}'.lower() in seen:
+                i += 1
+            name = f'{name} {i}'
+        seen.add(name.lower())
+        out.append({'name': name, 'type': kind})
+    return out
+
+
+def stop_bot(room, name):
+    """Retire one AI thread and forget its seat. Caller holds LOCK."""
+    client = room.bot_clients.pop(name, None)
+    room.bot_pids.pop(name, None)
+    if client:
+        client.stop.set()
+
+
+def _note_bot_pid(room, name, client, pid):
+    """Record the seat's pid (via the client's on_joined callback) so a later
+    restart or rematch can tell the seat is ours and let a new client claim it."""
+    with LOCK:
+        if room.alive() and room.bot_clients.get(name) is client:
+            room.bot_pids[name] = pid
+
+
+def _bot_worker(room, spec, client):
+    """Drive one AI seat for the life of the process. The client exits on its own
+    when kicked, reset or settled; the watchdog below only guards against a join
+    that never lands (name taken or room full), and we bookkeep the rest."""
+    runner = threading.Thread(target=client.run, daemon=True)
+    runner.start()
+    deadline = time.time() + BOT_JOIN_TIMEOUT_S
+    while client.pid is None and not client.stop.is_set():
+        if time.time() > deadline:
+            client.stop.set()
+            with LOCK:
+                if room.alive():
+                    E.note(room.game, f"AI player {spec['name']} could not join — "
+                                      'name taken or the room is full', now_ms())
+                    if room.bot_clients.get(spec['name']) is client:
+                        room.bot_clients.pop(spec['name'], None)
+                    room.bot_pids.pop(spec['name'], None)
+            return
+        time.sleep(0.1)
+    runner.join()
+    with LOCK:
+        if room.alive():
+            if room.bot_clients.get(spec['name']) is client:
+                room.bot_clients.pop(spec['name'], None)
+            if room.bot_pids.get(spec['name']) == client.pid:
+                room.bot_pids.pop(spec['name'], None)
+
+
+def start_bot(room, spec, local_url, allow_claim):
+    """Spawn the daemon threads for one AI seat. Caller holds LOCK; the seat's
+    first HTTP round-trip blocks on LOCK until the caller's mutation lands."""
+    client = B.Client(local_url, room.code, spec['name'], spec['type'], allow_claim=allow_claim)
+    client.on_joined = lambda pid: _note_bot_pid(room, spec['name'], client, pid)
+    room.bot_clients[spec['name']] = client
+    threading.Thread(target=_bot_worker, args=(room, spec, client), daemon=True).start()
+
+
+def sync_bots(room, local_url):
+    """Make the room's AI threads match room.bots. Caller holds LOCK.
+
+    A seat is "ours" when its pid is one we recorded as spawned — only then may a
+    new client claim it (after a restart or rematch). A seat with a bot-spec name
+    held by a HUMAN is never claimed: that bot is skipped and the host is told."""
+    g = room.game
+    # retire threads whose spec row was removed; if one of their seats is still in
+    # the lobby, kick it too, or it would sit the next deal out as a ghost
+    for name in [n for n in room.bot_clients if n not in {b['name'] for b in room.bots}]:
+        seat = E.find_active_by_name(g, name)
+        stop_bot(room, name)
+        if seat and g['phase'] == 'lobby':
+            E.kick_player(g, seat['id'], now_ms())
+    for spec in room.bots:
+        name = spec['name']
+        if name in room.bot_clients:
+            continue    # already running (or joining) — no churn on re-save
+        seat = E.find_active_by_name(g, name)
+        ours = seat is not None and seat['id'] == room.bot_pids.get(name)
+        if seat and not ours:
+            E.note(g, f"AI player {name} could not join — the seat is already taken",
+                   now_ms())
+            continue
+        start_bot(room, spec, local_url, allow_claim=ours)
 
 
 # ---------------------------------------------------------------- rate limiting
@@ -236,7 +353,8 @@ def save_room(room):
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump({'code': room.code, 'game': room.game, 'tokens': room.tokens,
                        'hostKey': room.host_key, 'created': room.created,
-                       'lastActive': room.last_active}, f)
+                       'lastActive': room.last_active, 'bots': room.bots,
+                       'botPids': room.bot_pids}, f)
         os.replace(tmp, room_file(room.code))
     except OSError as e:
         print(f'[gm] failed to save room {room.code}: {e}', flush=True)
@@ -293,6 +411,11 @@ def load_rooms():
             room.tokens = snap.get('tokens', {})
             room.created = snap.get('created', now)
             room.last_active = snap.get('lastActive', now)
+            room.bots = sanitize_bot_spec(snap.get('bots'))
+            room.bot_pids = {n: p for n, p in (snap.get('botPids') or {}).items()
+                             if n in {b['name'] for b in room.bots}}
+            # (the AI threads themselves are re-spawned in main(), once the
+            # loopback URL is known — see the resume block there)
             if now - room.last_active > room_ttl_ms(room):
                 os.remove(path)          # expired while the server was down
                 continue
@@ -309,7 +432,7 @@ def load_rooms():
 def broadcast(room):
     """Push a per-audience view of the room's state to every open stream."""
     extras = {'now': now_ms(), 'joinUrl': room.join_url(), 'hostUrl': room.host_url(),
-              'roomCode': room.code, 'connections': room.connections()}
+              'roomCode': room.code, 'connections': room.connections(), 'bots': room.bots}
     for c in list(room.clients):
         payload = json.dumps(E.view_for(room.game, c.kind, c.pid, extras))
         try:
@@ -491,7 +614,8 @@ class Handler(BaseHTTPRequestHandler):
                                           {'now': now_ms(), 'joinUrl': room.join_url(),
                                            'hostUrl': room.host_url(),
                                            'roomCode': room.code,
-                                           'connections': room.connections()})
+                                           'connections': room.connections(),
+                                           'bots': room.bots})
                     return self.reply(200, view)
                 except E.GameError as e:
                     return self.reply(ERROR_CODES.get(e.code, 400), {'error': str(e)})
@@ -739,6 +863,13 @@ class Handler(BaseHTTPRequestHandler):
             now = now_ms()
             if action == 'settings':
                 E.set_settings(game, body.get('settings') or {}, now)
+                if 'bots' in body:
+                    # AI seats are lobby-only: join order fixes their roles, and
+                    # the engine refuses new players after the deal
+                    if game['phase'] != 'lobby':
+                        raise E.GameError('AI players can only be changed in the lobby.')
+                    room.bots = sanitize_bot_spec(body['bots'])
+                    sync_bots(room, LOCAL_URL)
             elif action == 'role':
                 E.set_role(game, body.get('pid'), body.get('role'), now)
             elif action == 'start':
@@ -764,13 +895,25 @@ class Handler(BaseHTTPRequestHandler):
                 E.kick_player(game, pid, now)
                 for t in [t for t, p in room.tokens.items() if p == pid]:
                     del room.tokens[t]
+                # kicking an AI seat also drops it from the host's AI list, so it
+                # does not reappear on the next rematch
+                for name in [n for n, p in room.bot_pids.items() if p == pid]:
+                    room.bots = [b for b in room.bots if b['name'] != name]
+                    stop_bot(room, name)
             elif action == 'rematch':
                 E.rematch(game, now)
+                if room.bots:
+                    sync_bots(room, LOCAL_URL)   # their seats survived; reclaim them
             elif action == 'reset':
                 room.game = E.create_game()
                 room.tokens.clear()
                 room.recent_req.clear()
                 E.note(room.game, 'Fresh game created', now)
+                for name in list(room.bot_clients):
+                    stop_bot(room, name)
+                room.bot_pids.clear()
+                if room.bots:
+                    sync_bots(room, LOCAL_URL)   # the AI list survives the reset
             else:
                 raise E.GameError('Unknown host action.')
             touched(room)
@@ -791,7 +934,7 @@ def lan_ip():
 
 
 def main():
-    global BASE_URL
+    global BASE_URL, LOCAL_URL
     # Windows pipes (CI, redirects) default to cp1252, which can't print the ♠♥ banner.
     if hasattr(sys.stdout, 'reconfigure'):
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -813,6 +956,7 @@ def main():
 
     port = server.server_address[1]
     BASE_URL = (os.environ.get('JOIN_URL') or f'http://{lan_ip()}:{port}').rstrip('/')
+    LOCAL_URL = f'http://127.0.0.1:{port}'
     print(f'[gm] listening on http://127.0.0.1:{port}', flush=True)
     line = '─' * 62
     print(f"""
@@ -837,6 +981,8 @@ def main():
     with LOCK:
         for room in ROOMS.values():
             rearm(room)  # resume saved phase timers, if any
+            if room.bots and room.game['phase'] != 'settled':
+                sync_bots(room, LOCAL_URL)   # resume AI seats left behind by the restart
 
     reaper = threading.Thread(target=reaper_loop, daemon=True)
     reaper.start()

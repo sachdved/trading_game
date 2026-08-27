@@ -284,6 +284,20 @@ legitimately allowed to know.
 
 ### 3.2 Playing against them
 
+**From the lobby (no extra process):** the host's settings panel has an
+**AI players** section — a list of seats, each with a name and one of the four
+strategies. Saving the settings makes the server run those seats in-process,
+each as a daemon thread of this same client pointed at its own loopback URL,
+so nothing is ever deployed or exposed separately. From there everything is
+ordinary: the seats appear in the roster (🤖), join order determines role in
+assigned mode, the host can kick them (which also drops them from the AI
+list), a rematch reclaims their seats, a reset re-joins them, and a server
+restart resumes them from the room snapshot. The AI list is lobby-only, since
+join order fixes roles.
+
+**As standalone processes** (e.g. on another machine, or to run bots the host
+didn't configure):
+
 ```
 python3 server.py                                # host the room as usual
 python3 bot.py --url http://LAPTOP:3000 --code KFQTR --type ev

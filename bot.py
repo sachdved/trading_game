@@ -928,7 +928,7 @@ DEFAULT_NAMES = {'ev': 'EV Bot', 'bluff': 'Bluffer', 'mix': 'Mixer', 'noise': 'N
 
 
 class Client:
-    def __init__(self, url, code, name, bot_type, seed=None):
+    def __init__(self, url, code, name, bot_type, seed=None, allow_claim=True):
         self.base = url.rstrip('/')
         parsed = urllib.parse.urlsplit(self.base)
         self.scheme = parsed.scheme or 'http'
@@ -939,6 +939,9 @@ class Client:
         self.seed = seed
         self.strategy = make_strategy(bot_type, seed)
         self.token = None
+        self.pid = None
+        self.allow_claim = allow_claim
+        self.on_joined = None   # optional callback(pid) fired once the seat is ours
         self.stop = threading.Event()
         self.view = None
         self.view_lock = threading.Lock()
@@ -961,11 +964,21 @@ class Client:
                 body = json.loads(e.read().decode() or '{}')
             except ValueError:
                 body = {}
-            if e.code == 409 and body.get('canClaim'):
+            # A duplicate-name join means a seat with our name exists. The server
+            # answers 409 'taken' in the lobby but 400 'started' mid-game, and in
+            # both cases offers canClaim — so gate on the body, not the status
+            # (the web client does the same). Claiming is only safe when the host
+            # told us the seat is ours (embedded bots pass allow_claim=False on
+            # fresh joins, so a name a human took can never be stolen mid-join).
+            if self.allow_claim and body.get('canClaim') \
+                    and body.get('code') in ('taken', 'started'):
                 d = self.post('/api/claim', {'name': self.name})
             else:
                 raise
         self.token = d['token']
+        self.pid = d.get('pid')
+        if self.on_joined is not None:
+            self.on_joined(self.pid)
 
     def stream(self):
         while not self.stop.is_set() and not self.gone:

@@ -108,6 +108,8 @@ input:focus, select:focus { border-color: var(--accent); }
 label { display: block; font-size: .8rem; color: var(--muted); margin: 0 0 4px 2px; font-weight: 600; }
 .field { margin-bottom: 10px; }
 .formrow { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.formrow.botrow { grid-template-columns: 1fr 1fr auto; align-items: end; }
+.formrow.botrow .btn { margin-bottom: 10px; }
 
 .stepper { display: flex; align-items: stretch; gap: 8px; }
 .stepper input { text-align: center; font-size: 1.2rem; font-weight: 700; max-width: 90px; }
